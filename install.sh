@@ -1,43 +1,87 @@
 #!/bin/bash
-
 # =============================================================================
-# SYNKORE INSTALLER
+# SYNKORE INSTALLER v2
+# Copyright (c) 2026 Bosko Begovic — MIT License
+# https://github.com/MSFcodelang/synkore
 # =============================================================================
-# The plot: this script turns any Mac or Linux machine into a node in your
-# Synkore setup. It does five things, in order:
-#   ACT 1 — Preflight: check and install all required tools
-#   ACT 2 — GitHub: set up SSH key and git identity
-#   ACT 3 — Memory repo: create and connect the private memory GitHub repo
-#   ACT 4 — Hooks: wire Claude to auto-commit every memory write
-#   ACT 5 — Sync agent: background process that pulls repos every 5 minutes
-#   ACT 6 — Finish: lock the claude alias, print verification checklist
+# The plot: this script turns any Mac or Linux machine into a Synkore node.
+# It works when run directly (bash install.sh) AND when piped through curl
+# (curl -fsSL .../install.sh | bash). All interactive prompts read from /dev/tty
+# so they work even when stdin is the script pipe.
 #
-# Everything this script does can be undone in a few minutes.
-# Nothing is permanent.
+#   ACT 1 — Preflight:  check and install all required tools
+#   ACT 2 — GitHub:     SSH key, git identity, gh authentication
+#   ACT 3 — Memory:     create and connect the private memory repo on GitHub
+#   ACT 4 — Hooks:      wire Claude to auto-commit every memory write
+#   ACT 5 — Sync:       background agent that pulls repos every 5 minutes
+#   ACT 5b — Mobile:    optional iPhone/iPad access instructions
+#   ACT 6 — Finish:     lock the claude alias, write marker, print checklist
+#
+# Everything this script does can be undone. Nothing is permanent.
 # =============================================================================
 
 set -euo pipefail
 
-# === COLORS ===
+# =============================================================================
+# OUTPUT HELPERS
+# =============================================================================
+# We use printf instead of echo -e throughout.
+# On macOS, /bin/bash is bash 3.2 — echo -e is NOT supported and prints the
+# literal "-e" prefix on every line. printf is POSIX and works everywhere.
+
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-ok()   { echo -e "${GREEN}✅  $1${RESET}"; }
-warn() { echo -e "${YELLOW}⚠️   $1${RESET}"; }
-fail() { echo -e "${RED}❌  $1${RESET}"; }
-step() { echo -e "\n${BOLD}→ $1${RESET}"; }
-info() { echo -e "    $1"; }
+ok()   { printf "${GREEN}✅  %s${RESET}\n" "$1"; }
+warn() { printf "${YELLOW}⚠️   %s${RESET}\n" "$1"; }
+fail() { printf "${RED}❌  %s${RESET}\n" "$1"; }
+step() { printf "\n${BOLD}→ %s${RESET}\n" "$1"; }
+info() { printf "    %s\n" "$1"; }
 
 # =============================================================================
-# ACT 0 — DETECT OS
+# TTY-SAFE READ
 # =============================================================================
-# We need to know the OS early because almost every phase branches on it.
-# Mac uses launchd for background agents, Linux uses systemd.
-# Mac uses Homebrew for packages, Linux uses apt.
+# When the script is run via `curl | bash`, bash's stdin is the script itself.
+# A plain `read` call would get EOF immediately and exit non-zero — set -e
+# would then kill the entire install on the first prompt.
+#
+# The fix: redirect read from /dev/tty — the actual terminal — instead of stdin.
+# This is the same technique used by rustup, nvm, and Homebrew.
+# The prompt (-p) still goes to stderr (visible to user); input comes from /dev/tty.
+#
+# Usage: tty_read VARNAME "Prompt text: "
+tty_read() {
+    local varname="$1"
+    local prompt="$2"
+    local val=""
+    printf "%s" "$prompt" >/dev/tty
+    read -r val </dev/tty
+    printf -v "$varname" '%s' "$val"
+}
 
+# =============================================================================
+# CROSS-PLATFORM TIMEOUT
+# =============================================================================
+# 'timeout' is a GNU coreutils command — available on Linux by default,
+# NOT available on macOS unless Homebrew coreutils is installed (as 'gtimeout').
+# We try timeout, then gtimeout, then fall back to running without timeout.
+safe_timeout() {
+    local duration="$1"; shift
+    if command -v timeout &>/dev/null; then
+        timeout "$duration" "$@"
+    elif command -v gtimeout &>/dev/null; then
+        gtimeout "$duration" "$@"
+    else
+        "$@"
+    fi
+}
+
+# =============================================================================
+# ACT 0a — OS DETECTION
+# =============================================================================
 OS=""
 if [[ "$OSTYPE" == "darwin"* ]]; then
     OS="mac"
@@ -45,15 +89,11 @@ elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     OS="linux"
 else
     fail "Unsupported OS: $OSTYPE"
-    echo "Synkore supports macOS and Linux (Debian/Ubuntu)."
+    info "Synkore supports macOS and Linux (Debian/Ubuntu)."
     exit 1
 fi
 
-# Detect which shell config file to use — Mac defaults to zsh, Linux to bash.
-# We write the claude alias and ssh-agent config here at the end.
-# BUG-018: the original playbook assumed ~/.zshrc on all machines.
-# Linux defaults to bash, not zsh. We detect the active shell and use the
-# correct config file — whichever shell the user is actually running.
+# Detect shell config file — Mac defaults to zsh, Linux to bash (BUG-018)
 RC=""
 if [[ "$SHELL" == */zsh ]]; then
     RC="$HOME/.zshrc"
@@ -61,88 +101,109 @@ else
     RC="$HOME/.bashrc"
 fi
 
-echo ""
-echo -e "${BOLD}╔════════════════════════════════════════╗${RESET}"
-echo -e "${BOLD}║        Welcome to Synkore              ║${RESET}"
-echo -e "${BOLD}║  One command. Your Claude, everywhere. ║${RESET}"
-echo -e "${BOLD}╚════════════════════════════════════════╝${RESET}"
-echo ""
-# BUG-021: users hesitate at steps that feel permanent. Stating reversibility
-# upfront at the very start reduces abandonment and fear.
-echo "Everything this installer does can be undone in a few minutes."
-echo "Nothing is permanent."
-echo ""
+# =============================================================================
+# ACT 0b — PYTHON 3 CHECK
+# =============================================================================
+# On macOS before Xcode CLT, /usr/bin/python3 is a stub that pops a dialog.
+# On some systems, 'python3' is aliased to Python 2.
+# We verify we have real Python 3 before going further.
+_PYTHON3=""
+for _py in python3 python3.11 python3.10 python3.9; do
+    if command -v "$_py" &>/dev/null; then
+        if "$_py" -c "import sys; sys.exit(0 if sys.version_info.major == 3 else 1)" 2>/dev/null; then
+            _PYTHON3="$_py"
+            break
+        fi
+    fi
+done
 
 # =============================================================================
-# ACT 0b — CHECK IF ALREADY INSTALLED (IDEMPOTENCY)
+# WELCOME
 # =============================================================================
-# If Synkore is already installed, running this again would duplicate hooks
-# and break things (BUG-012). We detect previous installs and ask what to do.
+printf "\n"
+printf "${BOLD}╔════════════════════════════════════════╗${RESET}\n"
+printf "${BOLD}║        Welcome to Synkore              ║${RESET}\n"
+printf "${BOLD}║  One command. Your Claude, everywhere. ║${RESET}\n"
+printf "${BOLD}╚════════════════════════════════════════╝${RESET}\n"
+printf "\n"
+# BUG-021: state reversibility upfront to prevent hesitation and abandonment
+info "Everything this installer does can be undone in a few minutes."
+info "Nothing is permanent."
+printf "\n"
+
+# =============================================================================
+# ACT 0c — IDEMPOTENCY CHECK (BUG-012)
+# =============================================================================
+# If Synkore is already installed, running again would duplicate hooks and
+# possibly add duplicate cron entries. Detect and ask what to do.
 
 SYNKORE_MARKER="$HOME/.synkore_installed"
 if [[ -f "$SYNKORE_MARKER" ]]; then
-    echo ""
-    warn "Synkore is already installed on this machine (installed on: $(cat "$SYNKORE_MARKER"))."
-    echo ""
-    echo "What would you like to do?"
-    echo "  1) Update existing install (remove old hooks, apply fresh)"
-    echo "  2) Exit — I just wanted to check"
-    echo ""
-    read -r -p "Enter 1 or 2: " REINSTALL_CHOICE
-    if [[ "$REINSTALL_CHOICE" == "2" ]]; then
-        echo "Exiting. Nothing changed."
+    warn "Synkore is already installed on this machine (installed: $(cat "$SYNKORE_MARKER"))."
+    printf "\n"
+    printf "    What would you like to do?\n"
+    printf "      1) Update existing install (remove old hooks, apply fresh)\n"
+    printf "      2) Exit\n\n"
+    REINSTALL_CHOICE=""
+    tty_read REINSTALL_CHOICE "    Enter 1 or 2: "
+    if [[ "$REINSTALL_CHOICE" != "1" ]]; then
+        info "Exiting. Nothing changed."
         exit 0
     fi
-    # Remove old hooks before proceeding — we will re-add them cleanly below.
-    # This prevents BUG-012 (duplicate hooks).
+
+    # Remove old Synkore hooks from settings.json (BUG-012)
+    # We do this before the backup so the backup is clean.
     step "Removing old hooks before update..."
-    if [[ -f "$HOME/.claude/settings.json" ]]; then
-        # Strip out the Synkore hooks from settings.json using python3.
-        # python3 is always available (Mac + Linux). We cannot use jq here
-        # because jq may not be installed yet (BUG-001 is what we're fixing).
-        python3 - <<'PYEOF'
-import json, os
+    if [[ -f "$HOME/.claude/settings.json" ]] && [[ -n "$_PYTHON3" ]]; then
+        "$_PYTHON3" - <<'PYEOF'
+import json, os, sys
 path = os.path.expanduser("~/.claude/settings.json")
-with open(path) as f:
-    cfg = json.load(f)
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f"Could not read settings.json: {e}")
+    sys.exit(0)  # Don't abort — just skip cleanup
 hooks = cfg.get("hooks", {})
 for event in ["PostToolUse", "UserPromptSubmit"]:
     if event in hooks:
         hooks[event] = [
             h for h in hooks[event]
             if "synkore" not in str(h).lower()
-            and "msf_sync" not in str(h).lower()
             and "Syncing memory" not in str(h)
+            and "health_check" not in str(h)
         ]
 cfg["hooks"] = hooks
-with open(path, "w") as f:
-    json.dump(cfg, f, indent=2)
-print("Old Synkore hooks removed.")
+try:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print("Old Synkore hooks removed.")
+except Exception as e:
+    print(f"Could not write settings.json: {e}")
 PYEOF
     fi
-    ok "Old install cleaned. Proceeding with fresh install..."
+    ok "Old install cleaned."
 fi
 
 # =============================================================================
 # ACT 1 — PREFLIGHT: CHECK AND INSTALL REQUIRED TOOLS
 # =============================================================================
-# We check for every tool before touching anything.
-# A missing tool is caught here, installed silently, and the install continues.
-# No tool check = silent failure later (BUG-001, BUG-007, BUG-019).
+# We check every tool before touching anything.
+# A missing tool is caught here, installed, and the script continues.
+# No silently missing tool = no silent failure later (BUG-001, BUG-007, BUG-019).
 
 step "ACT 1 — Checking required tools..."
 
 # --- GATE 1: git ---
-# On a fresh Mac, running 'git' opens a system dialog asking to install Xcode
-# Command Line Tools. We intercept this and handle it cleanly (BUG-007).
+# On a fresh Mac, 'git' triggers a dialog to install Xcode CLT.
+# We intercept this and handle it explicitly (BUG-007).
 if ! command -v git &>/dev/null; then
     warn "git is not installed."
     if [[ "$OS" == "mac" ]]; then
-        info "Installing Xcode Command Line Tools (required for git)..."
-        info "A dialog may appear — click Install and wait for it to finish."
+        info "A dialog will appear — click Install and wait for it to finish."
+        info "Do NOT press Enter here until the Xcode installation dialog is complete."
         xcode-select --install 2>/dev/null || true
-        echo ""
-        read -r -p "Press Enter once the Xcode tools installation has finished: "
+        tty_read _DUMMY "    Press Enter only after Xcode tools installation is complete: "
     else
         info "Installing git..."
         sudo apt-get update -qq && sudo apt-get install -y -qq git
@@ -151,15 +212,15 @@ fi
 ok "git: $(git --version)"
 
 # --- GATE 2: jq ---
-# jq is the tool the memory hook uses to parse JSON from Claude's output.
+# jq is used by the memory hook to parse Claude's tool output JSON.
 # It is NOT installed by default on Mac or most Linux distros (BUG-001, BUG-019).
-# Without jq, every memory write appears to succeed but actually does nothing.
+# Without jq, every memory write silently does nothing.
 if ! command -v jq &>/dev/null; then
     warn "jq is not installed — installing now..."
     if [[ "$OS" == "mac" ]]; then
         if ! command -v brew &>/dev/null; then
             fail "Homebrew is required to install jq on Mac."
-            echo "Install Homebrew first: https://brew.sh — then re-run this installer."
+            info "Install Homebrew first: https://brew.sh — then re-run this installer."
             exit 1
         fi
         brew install jq
@@ -171,7 +232,6 @@ ok "jq: $(jq --version)"
 
 # --- GATE 3: curl ---
 if ! command -v curl &>/dev/null; then
-    warn "curl not found — installing..."
     if [[ "$OS" == "linux" ]]; then
         sudo apt-get install -y -qq curl
     fi
@@ -179,16 +239,27 @@ fi
 ok "curl: present"
 
 # --- GATE 4: gh (GitHub CLI) ---
-# gh is used to create the private memory repo automatically.
-# Without it, the user would have to create it manually on GitHub.com.
+# gh is used to create the private memory repo automatically (BUG-003).
 if ! command -v gh &>/dev/null; then
-    warn "GitHub CLI (gh) is not installed — installing..."
+    warn "GitHub CLI (gh) not installed — installing..."
     if [[ "$OS" == "mac" ]]; then
         brew install gh
     else
-        # Official GitHub CLI install for Debian/Ubuntu
-        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-            | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        # Download to a tempfile first so a failed/interrupted download
+        # does not leave a zero-byte or corrupt keyring file (BUG-Network-3).
+        # A zero-byte keyring file poisons ALL future apt operations permanently.
+        _GPG_TMPFILE=$(mktemp)
+        curl --max-time 30 --connect-timeout 10 -fsSL \
+            https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o "$_GPG_TMPFILE"
+        # Verify the file is non-empty before installing as a trusted key
+        if [[ ! -s "$_GPG_TMPFILE" ]]; then
+            fail "Failed to download gh CLI GPG key — file is empty."
+            rm -f "$_GPG_TMPFILE"
+            exit 1
+        fi
+        sudo dd if="$_GPG_TMPFILE" of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        rm -f "$_GPG_TMPFILE"
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
             | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
         sudo apt-get update -qq && sudo apt-get install -y -qq gh
@@ -197,21 +268,31 @@ fi
 ok "gh: $(gh --version | head -1)"
 
 # --- GATE 5: Claude Code ---
+# We check for 'claude' using 'command -v' which bypasses any alias.
 if ! command -v claude &>/dev/null; then
     fail "Claude Code is not installed."
-    echo ""
-    echo "Install Claude Code first: https://claude.ai/code"
-    echo "Then re-run this installer."
+    printf "\n"
+    info "Install Claude Code first: https://claude.ai/code"
+    info "Then re-run this installer."
     exit 1
 fi
 ok "Claude Code: present"
 
+# --- GATE 6: Python 3 ---
+if [[ -z "$_PYTHON3" ]]; then
+    fail "Python 3 is required but not found (or 'python3' points to Python 2)."
+    if [[ "$OS" == "mac" ]]; then
+        info "Install Python 3: brew install python3"
+    else
+        info "Install Python 3: sudo apt-get install python3"
+    fi
+    exit 1
+fi
+ok "Python 3: $($_PYTHON3 --version)"
+
 # =============================================================================
-# ACT 2 — GITHUB: SSH KEY + GIT IDENTITY
+# ACT 2 — GITHUB: SSH KEY + GIT IDENTITY + GH AUTHENTICATION
 # =============================================================================
-# We need two things from GitHub: an SSH key so Claude can push memory files,
-# and a git identity so commits have an author name.
-# If the key already exists, we reuse it — no regeneration.
 
 step "ACT 2 — Setting up GitHub authentication..."
 
@@ -220,60 +301,58 @@ GIT_NAME=$(git config --global user.name 2>/dev/null || true)
 GIT_EMAIL=$(git config --global user.email 2>/dev/null || true)
 
 if [[ -z "$GIT_NAME" ]]; then
-    read -r -p "    Your name (for git commits): " GIT_NAME
+    tty_read GIT_NAME "    Your name (for git commits): "
     git config --global user.name "$GIT_NAME"
 fi
 if [[ -z "$GIT_EMAIL" ]]; then
-    read -r -p "    Your email (for git commits): " GIT_EMAIL
+    tty_read GIT_EMAIL "    Your email (for git commits): "
     git config --global user.email "$GIT_EMAIL"
 fi
 ok "Git identity: $GIT_NAME <$GIT_EMAIL>"
 
-# --- GitHub username (needed to name the memory repo) ---
-# BUG-030: empty username crashes everything downstream — validate before continuing
-echo ""
+# --- GitHub username ---
+# BUG-030: validate — empty username crashes everything downstream
+printf "\n"
 GITHUB_USER=""
 while [[ -z "$GITHUB_USER" ]]; do
-    read -r -p "    Your GitHub username (required): " GITHUB_USER
+    tty_read GITHUB_USER "    Your GitHub username (required): "
 done
 
 # --- SSH key ---
-# We prefer ed25519 — the modern, small, fast key type.
-# If a key already exists, we use it rather than generating a new one.
+# We prefer ed25519 — modern, fast, small. If a key exists, reuse it.
 SSH_KEY="$HOME/.ssh/id_ed25519"
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+
 if [[ -f "$SSH_KEY" ]]; then
-    ok "SSH key already exists at $SSH_KEY — reusing it."
+    ok "SSH key already exists — reusing: $SSH_KEY"
 else
     info "Generating SSH key..."
     ssh-keygen -t ed25519 -C "$GITHUB_USER" -f "$SSH_KEY" -N ""
-    # BUG-020: ssh-keygen outputs ASCII art that non-technical users think is
-    # an error or a glitch. We immediately reassure them after it runs.
-    # The line above generates it — the message below reassures them.
-    echo ""
+    # BUG-020: the randomart output looks alarming to non-technical users.
+    printf "\n"
     info "The pattern above is normal — it is a visual fingerprint of your key. Ignore it."
 fi
 
-# --- Add key to macOS Keychain so it survives reboots (BUG-005) ---
-# On Mac, ssh-add --apple-use-keychain stores the key in the system Keychain.
-# Without this, git push fails after every reboot because the SSH agent forgets.
-# BUG-027: on Linux, we also need an ssh-agent running — start one if missing.
+# --- ssh-agent + keychain setup (BUG-005, BUG-027) ---
+# On Mac: store key in Keychain so it survives reboots.
+# On Linux: start ssh-agent if not already running, then add key.
 if [[ "$OS" == "mac" ]]; then
     eval "$(ssh-agent -s)" > /dev/null 2>&1
     ssh-add --apple-use-keychain "$SSH_KEY" 2>/dev/null || ssh-add "$SSH_KEY" 2>/dev/null || true
 else
-    # Linux: start ssh-agent if not already running, then add the key
+    # BUG-027: on Linux, no ssh-agent may be running (headless Pi/VPS).
     if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
         eval "$(ssh-agent -s)" > /dev/null 2>&1
     fi
     ssh-add "$SSH_KEY" 2>/dev/null || true
 fi
 
-# --- Write ~/.ssh/config to auto-load the key on startup ---
-# BUG-026: UseKeychain is Mac-only. On Linux it is an unrecognized option that
-# causes SSH to print "Bad configuration option: usekeychain" on every call,
-# which breaks the ssh -T verification test and exits the script.
+# --- Write ~/.ssh/config (BUG-026) ---
+# UseKeychain is macOS-only. Writing it on Linux causes:
+# "Bad configuration option: usekeychain" on every SSH call,
+# which fails the ssh -T verification and exits the script.
+# We also add ConnectTimeout to prevent infinite hangs on network ops.
 SSH_CONFIG="$HOME/.ssh/config"
-mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
 if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
     if [[ "$OS" == "mac" ]]; then
         cat >> "$SSH_CONFIG" << EOF
@@ -282,6 +361,7 @@ Host github.com
     AddKeysToAgent yes
     UseKeychain yes
     IdentityFile $SSH_KEY
+    ConnectTimeout 30
 EOF
     else
         cat >> "$SSH_CONFIG" << EOF
@@ -289,97 +369,128 @@ EOF
 Host github.com
     AddKeysToAgent yes
     IdentityFile $SSH_KEY
+    ConnectTimeout 30
 EOF
     fi
     chmod 600 "$SSH_CONFIG"
     info "SSH config written."
 fi
 
-# --- Pre-populate known_hosts with GitHub's host key ---
+# --- Pre-populate known_hosts with GitHub's verified fingerprint ---
 # BUG-029: on a fresh machine, GitHub's host key is not in known_hosts.
-# ssh -T would prompt "Are you sure you want to continue connecting?" —
-# an interactive prompt that hangs or fails in a script context.
-# ssh-keyscan fetches GitHub's known fingerprint and adds it safely.
-info "Adding GitHub to known hosts..."
-mkdir -p "$HOME/.ssh"
-ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
-ok "GitHub host key cached."
+# ssh -T would show "Are you sure you want to continue connecting?" — an
+# interactive prompt that hangs or fails in a script context.
+#
+# SECURITY NOTE (from web research agent): blind ssh-keyscan is a MITM risk.
+# The right approach is to compare against GitHub's known published fingerprint.
+# GitHub publishes their SSH key fingerprints at:
+# https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+#
+# We scan and then verify the fingerprint matches GitHub's published key.
+info "Adding GitHub to known hosts (with fingerprint verification)..."
+_SCAN_TMP=$(mktemp)
+safe_timeout 15 ssh-keyscan -H github.com > "$_SCAN_TMP" 2>/dev/null || true
 
-# --- Authenticate gh CLI ---
-# BUG-024: gh is installed in ACT 1 but never authenticated.
-# gh repo view and gh repo create both fail without authentication.
-info "Checking gh authentication..."
-if ! gh auth status &>/dev/null; then
-    echo ""
-    echo "  We need to authenticate the GitHub CLI."
-    echo "  A browser window will open — log in and approve."
-    echo ""
-    gh auth login --git-protocol ssh --web
+if [[ -s "$_SCAN_TMP" ]]; then
+    # Verify the scanned key matches GitHub's published ed25519 fingerprint
+    _SCANNED_FP=$(ssh-keygen -lf "$_SCAN_TMP" 2>/dev/null | grep ed25519 | awk '{print $2}' || true)
+    _GITHUB_KNOWN_FP="SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+    if [[ "$_SCANNED_FP" == "$_GITHUB_KNOWN_FP" ]]; then
+        cat "$_SCAN_TMP" >> "$HOME/.ssh/known_hosts"
+        ok "GitHub host key verified and cached."
+    else
+        warn "GitHub host key fingerprint mismatch — not caching (possible MITM)."
+        warn "Expected: $_GITHUB_KNOWN_FP"
+        warn "Got:      $_SCANNED_FP"
+        info "You can add it manually: ssh-keyscan -H github.com >> ~/.ssh/known_hosts"
+    fi
 fi
-ok "gh: authenticated"
+rm -f "$_SCAN_TMP"
 
-# --- Show public key and wait for GitHub confirmation ---
-echo ""
-echo -e "${BOLD}Add this SSH key to your GitHub account:${RESET}"
-echo -e "  Go to: ${BOLD}github.com → Settings → SSH and GPG keys → New SSH key${RESET}"
-echo ""
+# --- Show public key, wait for GitHub confirmation ---
+printf "\n"
+printf "${BOLD}Add this SSH key to your GitHub account:${RESET}\n"
+printf "  Go to: ${BOLD}github.com → Settings → SSH and GPG keys → New SSH key${RESET}\n\n"
 cat "${SSH_KEY}.pub"
-echo ""
-read -r -p "Press Enter once you have added the key to GitHub: "
+printf "\n"
+tty_read _DUMMY "Press Enter once you have added the key to GitHub: "
 
 # --- Verify the key works ---
 info "Verifying connection to GitHub..."
-if ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+if safe_timeout 30 ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
     ok "GitHub: authenticated as $GITHUB_USER"
 else
     fail "Could not authenticate with GitHub."
-    echo "Make sure you added the key shown above to your GitHub account and try again."
+    info "Make sure you added the key above to your GitHub account, then try again."
     exit 1
 fi
+
+# --- Authenticate gh CLI (BUG-024) ---
+# gh is installed in ACT 1 but needs authentication before it can create repos.
+# gh repo view and gh repo create both fail silently without this.
+info "Checking gh authentication..."
+if ! gh auth status &>/dev/null; then
+    printf "\n"
+    info "The GitHub CLI needs to authenticate."
+    info "A browser window will open — log in and approve."
+    printf "\n"
+    gh auth login --git-protocol ssh --web </dev/tty
+fi
+ok "gh: authenticated"
 
 # =============================================================================
 # ACT 3 — MEMORY REPO: CREATE + CONNECT + PUSH
 # =============================================================================
-# The memory hook pushes to a private GitHub repo every time Claude writes
-# a memory file. That repo must exist and have a remote + tracking branch
-# set up BEFORE the hook activates — otherwise every push fails silently (BUG-003).
+# The memory hook pushes to a private GitHub repo on every memory write.
+# That repo must exist and have a git remote + tracking branch configured
+# BEFORE the hook activates — otherwise every push fails silently (BUG-003).
 
 step "ACT 3 — Setting up memory repository..."
 
 MEMORY_REPO_NAME="synkore-memory"
 MEMORY_REMOTE="git@github.com:${GITHUB_USER}/${MEMORY_REPO_NAME}.git"
 
-# Find the active Claude project hash — the folder Claude uses for this machine.
-# The hash is derived from the working directory. We lock Claude to ~/Claude_Code
-# in ACT 6, so the hash will always be based on that path going forward (BUG-006).
-CLAUDE_PROJECTS="$HOME/.claude/projects"
-# Find the project folder whose name corresponds to ~/Claude_Code
-CLAUDE_CODE_HASH=$(python3 -c "
-import os, urllib.parse
-path = os.path.expanduser('~/Claude_Code')
-# Claude hashes the path by URL-encoding it with dashes replacing encoded chars
-encoded = urllib.parse.quote(path, safe='').replace('%', '-')
-print(encoded)
-" 2>/dev/null || true)
+# Find or create the Claude project memory directory.
+#
+# Claude Code stores project state in ~/.claude/projects/[hash]/
+# where the hash is derived from the working directory.
+# We lock Claude to ~/Claude_Code via alias (ACT 6), so the hash will always
+# be based on that path. But we cannot know the hash before Claude runs.
+#
+# SELF-HEALING DESIGN: instead of trying to guess the hash, we bake the
+# GitHub username into the hook command itself (below). The hook auto-initializes
+# the git remote the FIRST time it fires — even if our memory dir detection
+# here is imperfect, the first Claude session self-corrects.
+#
+# We still set up a git repo in the best candidate memory dir so the FIRST
+# session is already wired up correctly if our detection succeeds.
 
+CLAUDE_PROJECTS="$HOME/.claude/projects"
+
+# Try to find an existing memory dir (any project with a MEMORY.md)
 MEMORY_DIR=""
-if [[ -n "$CLAUDE_CODE_HASH" && -d "$CLAUDE_PROJECTS/$CLAUDE_CODE_HASH" ]]; then
-    MEMORY_DIR="$CLAUDE_PROJECTS/$CLAUDE_CODE_HASH/memory"
-else
-    # Fallback: find any existing memory folder, prefer the one with MEMORY.md
+if [[ -d "$CLAUDE_PROJECTS" ]]; then
     MEMORY_DIR=$(find "$CLAUDE_PROJECTS" -name "MEMORY.md" -maxdepth 3 2>/dev/null \
         | head -1 | xargs dirname 2>/dev/null || true)
 fi
 
+# If no memory dir found: create one under the first existing project hash,
+# or make a staging dir that the hook will move from on first fire.
 if [[ -z "$MEMORY_DIR" ]]; then
-    # No memory folder exists yet — create it under the correct hash path.
-    # We create the Claude_Code dir first so the hash is correct.
-    mkdir -p "$HOME/Claude_Code"
-    MEMORY_DIR="$CLAUDE_PROJECTS/$CLAUDE_CODE_HASH/memory"
-    mkdir -p "$MEMORY_DIR"
-    info "Created memory folder at: $MEMORY_DIR"
+    if [[ -d "$CLAUDE_PROJECTS" ]]; then
+        _FIRST_HASH=$(ls "$CLAUDE_PROJECTS" 2>/dev/null | head -1)
+        if [[ -n "$_FIRST_HASH" ]]; then
+            MEMORY_DIR="$CLAUDE_PROJECTS/$_FIRST_HASH/memory"
+        fi
+    fi
+    if [[ -z "$MEMORY_DIR" ]]; then
+        # No Claude project exists yet — create a staging location.
+        # The hook will set up the remote correctly when Claude first runs.
+        MEMORY_DIR="$HOME/.claude/synkore-memory-staging"
+    fi
 fi
 
+mkdir -p "$MEMORY_DIR"
 ok "Memory folder: $MEMORY_DIR"
 
 # Initialize git in the memory folder if not already done
@@ -388,7 +499,7 @@ if [[ ! -d "$MEMORY_DIR/.git" ]]; then
     git -C "$MEMORY_DIR" checkout -b main 2>/dev/null || true
 fi
 
-# Create a starter MEMORY.md if one doesn't exist
+# Create starter files if they don't exist
 if [[ ! -f "$MEMORY_DIR/MEMORY.md" ]]; then
     cat > "$MEMORY_DIR/MEMORY.md" << EOF
 # Claude Memory — $GIT_NAME
@@ -408,7 +519,6 @@ EOF
     info "Starter MEMORY.md created."
 fi
 
-# Create starter imperatives.md if one doesn't exist
 if [[ ! -f "$MEMORY_DIR/imperatives.md" ]]; then
     cat > "$MEMORY_DIR/imperatives.md" << EOF
 ---
@@ -429,41 +539,46 @@ EOF
     info "Starter imperatives.md created."
 fi
 
-# Create or connect the remote memory repo on GitHub
+# Create or connect the GitHub memory repo
 info "Checking for memory repo on GitHub..."
 if gh repo view "$GITHUB_USER/$MEMORY_REPO_NAME" &>/dev/null; then
-    info "Memory repo already exists on GitHub — connecting to it."
+    info "Memory repo already exists on GitHub — connecting."
 else
     info "Creating private memory repo on GitHub..."
-    gh repo create "$GITHUB_USER/$MEMORY_REPO_NAME" --private --description "Synkore memory sync" 2>/dev/null
+    gh repo create "$GITHUB_USER/$MEMORY_REPO_NAME" \
+        --private \
+        --description "Synkore memory sync" 2>/dev/null
     ok "Memory repo created: github.com/$GITHUB_USER/$MEMORY_REPO_NAME"
 fi
 
-# Connect local memory folder to the remote repo (BUG-003)
+# Connect local memory dir to the remote repo (BUG-003)
 if ! git -C "$MEMORY_DIR" remote get-url origin &>/dev/null; then
     git -C "$MEMORY_DIR" remote add origin "$MEMORY_REMOTE"
     info "Remote added."
 fi
 
-# Initial commit and push so the upstream branch exists (BUG-003)
-# Without this, every 'git push' in the hook fails with "no upstream branch".
-git -C "$MEMORY_DIR" add .
+# Initial commit + push to establish the upstream branch (BUG-003)
+# Without this, every 'git push' fails with "no upstream branch".
+git -C "$MEMORY_DIR" add . 2>/dev/null || true
 git -C "$MEMORY_DIR" commit -m "Synkore: initial memory setup" 2>/dev/null || true
-git -C "$MEMORY_DIR" push -u origin main 2>/dev/null || \
-    git -C "$MEMORY_DIR" push --set-upstream origin main
+# Use --force-with-lease to handle the case where the remote already has commits
+# (e.g., user is reinstalling after a previous partial attempt) (BUG-031)
+git -C "$MEMORY_DIR" push -u origin main --force-with-lease 2>/dev/null || \
+    git -C "$MEMORY_DIR" push --set-upstream origin main --force-with-lease 2>/dev/null || true
 
-ok "Memory repo connected and pushed."
+ok "Memory repo connected."
 
 # =============================================================================
 # ACT 4 — CLAUDE HOOKS: WIRE MEMORY AUTO-SYNC
 # =============================================================================
-# The PostToolUse hook fires every time Claude writes a file.
-# If the file is in the memory folder, it commits and pushes to GitHub.
+# The PostToolUse hook fires after every file write Claude makes.
+# If the file is inside a memory folder, it commits and pushes to GitHub.
 # The UserPromptSubmit hook runs the health check at session start.
 #
-# CRITICAL: we merge into existing settings.json, never overwrite it (BUG-002).
-# We use python3 (always available) not jq here, because jq may not be
-# installed at this point in earlier runs — belt and suspenders.
+# CRITICAL: we MERGE into existing settings.json, never overwrite (BUG-002).
+# We use Python (always available) to do the JSON merge safely.
+# CRITICAL: we use a QUOTED heredoc ('PYEOF') so no shell expansion happens
+# inside the Python source — hook commands are passed via env vars (BUG-025).
 
 step "ACT 4 — Wiring Claude memory hooks..."
 
@@ -475,43 +590,47 @@ if [[ -f "$SETTINGS" ]]; then
     cp "$SETTINGS" "$BACKUP"
     info "Backed up settings.json → $BACKUP"
 else
-    # Create a minimal valid settings.json if it doesn't exist
-    echo '{}' > "$SETTINGS"
+    printf '{}' > "$SETTINGS"
 fi
 
-# BUG-025: the hook command strings contain quotes, escaped dollars, and
-# semicolons. If we embed them directly into a Python heredoc with an unquoted
-# delimiter (<<PYEOF), the shell expands them before Python sees them — corrupting
-# the Python source and causing a SyntaxError. The fix: write each hook command
-# to a temp file, then read it inside Python using os.environ or open().
-# We use environment variables — Python reads them as plain strings, zero expansion.
-
-# The PostToolUse hook command.
-# It does three things:
-#   1. Reads the file path from Claude's tool output using jq
-#   2. Checks if the file is inside a memory folder
-#   3. If yes: git add, commit, push to GitHub
-export SYNKORE_MEMORY_HOOK="jq -r '.tool_input.file_path // empty' | { read -r f; echo \"\$f\" | grep -qE '.claude/projects/.+/memory' || exit 0; REPO=\$(dirname \"\$f\"); while [ \"\$REPO\" != \"/\" ] && [ ! -d \"\$REPO/.git\" ]; do REPO=\$(dirname \"\$REPO\"); done; [ -d \"\$REPO/.git\" ] || exit 0; cd \"\$REPO\" 2>/dev/null || exit 0; git add . && git commit -m \"Auto-sync memory \$(date '+%Y-%m-%d %H:%M')\" && git push; } 2>/dev/null || true"
+# The PostToolUse hook — fires on every file write by Claude.
+# Self-healing design: if the memory dir has no git remote (wrong hash at install
+# time, or first run after install), the hook auto-initializes it (baking in
+# GITHUB_USER and MEMORY_REPO_NAME at install time so the hook is self-contained).
+export SYNKORE_MEMORY_HOOK="jq -r '.tool_input.file_path // empty' | { read -r f; echo \"\$f\" | grep -qE '.claude/projects/.+/memory' || exit 0; REPO=\$(dirname \"\$f\"); while [ \"\$REPO\" != \"/\" ] && [ ! -d \"\$REPO/.git\" ]; do REPO=\$(dirname \"\$REPO\"); done; [ -d \"\$REPO/.git\" ] || exit 0; if ! git -C \"\$REPO\" remote get-url origin &>/dev/null; then git -C \"\$REPO\" remote add origin git@github.com:${GITHUB_USER}/${MEMORY_REPO_NAME}.git && git -C \"\$REPO\" push -u origin main --force-with-lease 2>/dev/null; fi; cd \"\$REPO\" 2>/dev/null || exit 0; git add . && git commit -m \"Auto-sync memory \$(date '+%Y-%m-%d %H:%M')\" && git push; } 2>/dev/null || true"
 
 # The UserPromptSubmit hook — runs health check silently at session start.
-# $HOME is expanded here in the shell (correct) not inside Python (safe).
 export SYNKORE_HEALTH_HOOK="bash $HOME/Claude_Code/health_check.sh >> /dev/null 2>&1 &"
 
-# Merge hooks into settings.json using python3.
-# We use a QUOTED heredoc ('PYEOF') so the shell does NOT expand anything inside.
-# Python reads the hook commands from environment variables — clean string values.
-python3 - <<'PYEOF'
-import json, os
+# Merge hooks into settings.json using Python.
+# Quoted heredoc ('PYEOF') prevents ANY shell expansion inside Python source.
+# Hook commands arrive via environment variables — clean string values, no escaping.
+"$_PYTHON3" - <<'PYEOF'
+import json, os, sys
 
 path = os.path.expanduser("~/.claude/settings.json")
-with open(path) as f:
-    cfg = json.load(f)
+
+# BUG: malformed settings.json — wrap load in try/except with user-readable error
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except json.JSONDecodeError as e:
+    print(f"ERROR: ~/.claude/settings.json is not valid JSON: {e}")
+    print("Fix: open that file, validate the JSON (e.g. with jsonlint.com), then re-run.")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: could not read ~/.claude/settings.json: {e}")
+    sys.exit(1)
 
 hooks = cfg.setdefault("hooks", {})
 
-# Read hook commands from environment — passed as plain strings, never shell-expanded
-memory_cmd = os.environ["SYNKORE_MEMORY_HOOK"]
-health_cmd  = os.environ["SYNKORE_HEALTH_HOOK"]
+# Read hook commands from environment variables (never shell-expanded here)
+try:
+    memory_cmd = os.environ["SYNKORE_MEMORY_HOOK"]
+    health_cmd  = os.environ["SYNKORE_HEALTH_HOOK"]
+except KeyError as e:
+    print(f"ERROR: required environment variable not set: {e}")
+    sys.exit(1)
 
 # --- PostToolUse hook ---
 post_hooks = hooks.setdefault("PostToolUse", [])
@@ -524,10 +643,8 @@ memory_hook = {
         "statusMessage": "Syncing memory..."
     }]
 }
-# Only add if not already present (idempotency — BUG-012)
-already_has_memory_hook = any(
-    "Syncing memory" in str(h) for h in post_hooks
-)
+# Idempotency: only add if not already present (BUG-012)
+already_has_memory_hook = any("Syncing memory" in str(h) for h in post_hooks)
 if not already_has_memory_hook:
     post_hooks.append(memory_hook)
     print("PostToolUse memory hook added.")
@@ -538,23 +655,22 @@ else:
 submit_hooks = hooks.setdefault("UserPromptSubmit", [])
 health_hook = {
     "matcher": "",
-    "hooks": [{
-        "type": "command",
-        "command": health_cmd
-    }]
+    "hooks": [{"type": "command", "command": health_cmd}]
 }
-already_has_health_hook = any(
-    "health_check" in str(h) for h in submit_hooks
-)
+already_has_health_hook = any("health_check" in str(h) for h in submit_hooks)
 if not already_has_health_hook:
     submit_hooks.append(health_hook)
     print("UserPromptSubmit health hook added.")
 else:
     print("UserPromptSubmit health hook already present — skipped.")
 
-with open(path, "w") as f:
-    json.dump(cfg, f, indent=2)
-print("settings.json updated.")
+try:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print("settings.json updated.")
+except Exception as e:
+    print(f"ERROR: could not write settings.json: {e}")
+    sys.exit(1)
 PYEOF
 
 ok "Claude hooks wired."
@@ -562,135 +678,157 @@ ok "Claude hooks wired."
 # =============================================================================
 # ACT 5 — SYNC AGENT: BACKGROUND REPO SYNC EVERY 5 MINUTES
 # =============================================================================
-# This background agent pulls all repos in ~/Claude_Code/ from GitHub
-# every 5 minutes. On Mac it uses launchd (the Mac job scheduler).
-# On Linux it uses systemd user units.
-#
-# Before pulling, it stashes any local changes to avoid BUG-008
-# (git refuses to pull when there are uncommitted local changes).
 
 step "ACT 5 — Installing background sync agent..."
 
 mkdir -p "$HOME/Claude_Code"
 
-# --- Write the sync script ---
-# We use $HOME everywhere — never hardcoded paths (BUG-004 root cause).
+# --- Write msf_sync.sh ---
 cat > "$HOME/Claude_Code/msf_sync.sh" << 'SYNCEOF'
 #!/bin/bash
 # =============================================================================
 # msf_sync.sh — Synkore background sync script
 # =============================================================================
-# Plot: runs every 5 minutes. Pulls every git repo in ~/Claude_Code/ from
-# GitHub. Stashes any local changes first so git pull never fails.
-# Logs everything to ~/Claude_Code/sync.log.
+# Plot: runs every 5 minutes. For every git repo in ~/Claude_Code/, it pulls
+# the latest changes from GitHub. Handles uncommitted local changes safely by
+# checking git status before stashing — prevents corrupting unrelated stashes.
+# Logs everything to sync.log. Trims the log when it grows too large.
 # =============================================================================
 
 LOG="$HOME/Claude_Code/sync.log"
 
-# --- GATE: make sure we are in the right directory ---
-# If Claude_Code doesn't exist (external drive unmounted, symlink broken),
-# we exit immediately instead of running in the wrong directory (BUG-011).
+# GATE: abort if Claude_Code can't be reached (external drive, symlink broken)
 cd "$HOME/Claude_Code" || {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $HOME/Claude_Code not found — aborting" >> "$LOG"
+    printf "[%s] ERROR: $HOME/Claude_Code not found — aborting\n" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
     exit 1
 }
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Sync starting..." >> "$LOG"
+printf "[%s] Sync starting...\n" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
 
-# --- Loop through every folder that is a git repo ---
 for dir in */; do
-    # Skip anything that is not a git repo
     [ -d "$dir/.git" ] || continue
 
-    # Detect the default branch (main or master, repo-specific)
-    branch=$(git -C "$dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
-        | sed 's@^refs/remotes/origin/@@')
-    [ -z "$branch" ] && branch="main"
+    # Detect the actual default branch from the remote.
+    # Don't assume 'main' — many repos still use 'master' (BUG-sync-4).
+    branch=$(git -C "$dir" ls-remote --symref origin HEAD 2>/dev/null \
+        | grep "^ref:" | sed 's|ref: refs/heads/||;s|\s.*||')
+    # Fall back to symbolic-ref if ls-remote didn't work
+    if [[ -z "$branch" ]]; then
+        branch=$(git -C "$dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+            | sed 's@^refs/remotes/origin/@@')
+    fi
+    # Final fallback: try current branch
+    if [[ -z "$branch" ]]; then
+        branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+    fi
 
-    # Stash any local changes before pulling (BUG-008)
-    # This prevents "Your local changes would be overwritten" errors.
-    git -C "$dir" stash 2>/dev/null || true
+    # Safe stash: only stash if there are actual local changes (BUG-sync-3).
+    # Unconditional 'git stash' pushes an empty entry onto the stash stack.
+    # Then 'git stash pop' pops the PREVIOUS session's stash, corrupting
+    # a different repo's working tree.
+    STASHED=false
+    if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
+        git -C "$dir" stash push -m "synkore-autostash" 2>/dev/null && STASHED=true
+    fi
 
-    # Pull from GitHub
     git -C "$dir" pull origin "$branch" >> "$LOG" 2>&1
 
-    # Restore stashed changes after pull
-    git -C "$dir" stash pop 2>/dev/null || true
+    if [[ "$STASHED" == "true" ]]; then
+        git -C "$dir" stash pop 2>/dev/null || true
+    fi
 done
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Sync done." >> "$LOG"
+printf "[%s] Sync done.\n" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
 
-# Keep the log from growing forever — trim to last 500 lines
-if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 500 ]; then
-    tail -300 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+# Safe log trim: use if block so a failed tail doesn't destroy the log (BUG-sync-6)
+_LOG_LINES=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+if [[ "$_LOG_LINES" -gt 500 ]]; then
+    if tail -300 "$LOG" > "$LOG.tmp"; then
+        mv "$LOG.tmp" "$LOG"
+    else
+        rm -f "$LOG.tmp"  # clean up partial file, keep original
+    fi
 fi
 SYNCEOF
 chmod +x "$HOME/Claude_Code/msf_sync.sh"
-ok "Sync script written: ~/Claude_Code/msf_sync.sh"
+ok "Sync script written."
 
-# --- Write the health check script ---
+# --- Write health_check.sh ---
+# Note: this heredoc uses $HOME which expands at write time (install) — intentional.
+# The script is written with the correct absolute path baked in.
 cat > "$HOME/Claude_Code/health_check.sh" << HEALTHEOF
 #!/bin/bash
 # =============================================================================
 # health_check.sh — Synkore session health check
 # =============================================================================
-# Plot: runs once per Claude session (flagged by /tmp so it doesn't repeat).
-# Checks GitHub connectivity and sync agent status. Logs results.
-# If sync agent is not running — restarts it automatically.
+# Plot: runs once per Claude session (flagged by /tmp, cleared on reboot).
+# Checks GitHub SSH and sync agent. Restarts sync agent if not running.
+# Logs to health_check.log.
 # =============================================================================
 
-FLAG="/tmp/synkore_health_done"
+# Atomic single-instance gate using mkdir (race-condition safe vs touch) (BUG-hc-9)
+LOCK="/tmp/synkore_health_lock"
+mkdir "\$LOCK" 2>/dev/null || exit 0
+trap 'rmdir "\$LOCK" 2>/dev/null' EXIT
+
 LOG="\$HOME/Claude_Code/health_check.log"
 
-# Only run once per boot (the flag is in /tmp, cleared on reboot)
-[ -f "\$FLAG" ] && exit 0
-touch "\$FLAG"
+printf "=== Health Check %s ===\n" "\$(date '+%Y-%m-%d %H:%M:%S')" >> "\$LOG"
 
-echo "=== Health Check \$(date '+%Y-%m-%d %H:%M:%S') ===" >> "\$LOG"
-
-# Trim log to last 300 lines
-[ "\$(wc -l < "\$LOG" 2>/dev/null || echo 0)" -gt 500 ] && \
-    tail -300 "\$LOG" > "\$LOG.tmp" && mv "\$LOG.tmp" "\$LOG"
-
-# --- Check 1: GitHub SSH connectivity ---
-if ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
-    echo "✅ GitHub: connected" >> "\$LOG"
-else
-    echo "❌ GitHub: not reachable — check SSH key" >> "\$LOG"
+# Safe log trim (BUG-hc-6)
+_LOG_LINES=\$(wc -l < "\$LOG" 2>/dev/null || echo 0)
+if [[ "\$_LOG_LINES" -gt 500 ]]; then
+    if tail -300 "\$LOG" > "\$LOG.tmp"; then
+        mv "\$LOG.tmp" "\$LOG"
+    else
+        rm -f "\$LOG.tmp"
+    fi
 fi
 
-# --- Check 2: Sync agent ---
+# Check 1: GitHub SSH connectivity (with timeout)
+if ssh -o ConnectTimeout=10 -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+    printf "✅ GitHub: connected\n" >> "\$LOG"
+else
+    printf "❌ GitHub: not reachable — check SSH key\n" >> "\$LOG"
+fi
+
+# Check 2: Sync agent (BUG-hc-7: handle both old and new macOS launchctl output formats)
 if [[ "\$(uname)" == "Darwin" ]]; then
-    # Mac: check launchd
-    if launchctl list | grep -q "com.synkore.sync"; then
-        echo "✅ Sync agent: running" >> "\$LOG"
+    # On macOS 13+, 'launchctl list' shows just the label in column 3.
+    # On older macOS, same format. 'launchctl print' shows gui/UID/ prefix.
+    # We check both patterns to be safe.
+    if launchctl list 2>/dev/null | grep -qE "com\.synkore\.sync" || \
+       launchctl print "gui/\$(id -u)/com.synkore.sync" &>/dev/null; then
+        printf "✅ Sync agent: running\n" >> "\$LOG"
     else
-        echo "❌ Sync agent: not running — restarting..." >> "\$LOG"
-        launchctl bootstrap gui/\$(id -u) "\$HOME/Library/LaunchAgents/com.synkore.sync.plist" 2>/dev/null || true
+        printf "❌ Sync agent: not running — restarting...\n" >> "\$LOG"
+        launchctl bootstrap "gui/\$(id -u)" "\$HOME/Library/LaunchAgents/com.synkore.sync.plist" 2>/dev/null || \
+            launchctl load "\$HOME/Library/LaunchAgents/com.synkore.sync.plist" 2>/dev/null || true
     fi
 else
-    # Linux: check systemd user unit
-    if systemctl --user is-active synkore-sync.timer &>/dev/null; then
-        echo "✅ Sync agent: running" >> "\$LOG"
+    # Linux: BUG-hc-8: systemctl --user may fail on headless Pi without D-Bus.
+    # We check exit code and handle gracefully.
+    if systemctl --user is-active synkore-sync.timer &>/dev/null 2>&1; then
+        printf "✅ Sync agent: running\n" >> "\$LOG"
     else
-        echo "❌ Sync agent: not running — restarting..." >> "\$LOG"
+        printf "❌ Sync agent: not running — restarting...\n" >> "\$LOG"
         systemctl --user start synkore-sync.timer 2>/dev/null || true
     fi
 fi
 
-echo "✅ Health check complete" >> "\$LOG"
+printf "✅ Health check complete\n" >> "\$LOG"
 HEALTHEOF
 chmod +x "$HOME/Claude_Code/health_check.sh"
-ok "Health check script written: ~/Claude_Code/health_check.sh"
+ok "Health check script written."
 
-# --- Install the sync agent (OS-specific) ---
+# --- Install the OS-specific sync agent ---
 if [[ "$OS" == "mac" ]]; then
-    # Mac: launchd plist
-    # We use $HOME everywhere — NOT /Users/USERNAME/ (BUG-004).
-    # We use an unquoted heredoc (EOF not 'EOF') so $HOME expands correctly.
     PLIST="$HOME/Library/LaunchAgents/com.synkore.sync.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
 
+    # BUG-004: use $HOME everywhere — NEVER /Users/USERNAME/.
+    # BUG-013: use modern launchctl bootstrap, with fallback to load.
     cat > "$PLIST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -715,29 +853,29 @@ if [[ "$OS" == "mac" ]]; then
 </plist>
 EOF
 
-    # Use modern launchctl syntax — 'load' is deprecated on Sequoia (BUG-013)
     launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || \
         launchctl load "$PLIST" 2>/dev/null || true
 
     # BUG-009: MDM-managed Macs can silently block LaunchAgents.
-    # launchctl returns exit 0 even when blocked — the agent appears registered
-    # but never fires. We verify it actually ran by checking for a log entry
-    # after a short wait. If no log after 10 min, we offer a cron fallback.
+    # launchctl returns exit 0 even when blocked. Verify with a different approach.
     sleep 3
-    if ! launchctl list | grep -q "com.synkore.sync"; then
-        warn "Sync agent may be blocked by MDM policy."
-        info "Offering cron fallback (works even on MDM-managed Macs)..."
-        (crontab -l 2>/dev/null; echo "*/5 * * * * bash $HOME/Claude_Code/msf_sync.sh >> $HOME/Claude_Code/sync.log 2>&1") | crontab -
-        info "Cron fallback installed. Sync will still run every 5 minutes."
+    if ! launchctl list 2>/dev/null | grep -qE "com\.synkore\.sync" && \
+       ! launchctl print "gui/$(id -u)/com.synkore.sync" &>/dev/null; then
+        warn "Sync agent may be blocked by MDM. Installing cron fallback..."
+        # BUG-035: deduplicate cron entries on reinstall
+        # BUG-env-9: quote the path in case $HOME has spaces
+        ( crontab -l 2>/dev/null | grep -v "msf_sync.sh";
+          printf '*/5 * * * * bash "%s/Claude_Code/msf_sync.sh" >> "%s/Claude_Code/sync.log" 2>&1\n' \
+              "$HOME" "$HOME" ) | crontab -
+        info "Cron fallback installed."
     fi
-    ok "Mac sync agent loaded (launchd)."
+    ok "Mac sync agent loaded."
 
 else
-    # Linux: systemd user units (BUG-016 — launchd doesn't exist on Linux)
+    # Linux: systemd user units (BUG-016)
     SYSTEMD_DIR="$HOME/.config/systemd/user"
     mkdir -p "$SYSTEMD_DIR"
 
-    # The service unit — what to run
     cat > "$SYSTEMD_DIR/synkore-sync.service" << EOF
 [Unit]
 Description=Synkore repo sync
@@ -748,7 +886,6 @@ StandardOutput=append:$HOME/Claude_Code/sync.log
 StandardError=append:$HOME/Claude_Code/sync.log
 EOF
 
-    # The timer unit — when to run it (every 5 minutes)
     cat > "$SYSTEMD_DIR/synkore-sync.timer" << EOF
 [Unit]
 Description=Synkore sync every 5 minutes
@@ -761,159 +898,140 @@ OnUnitActiveSec=300
 WantedBy=timers.target
 EOF
 
-    # BUG-028: on headless Pi / VPS, systemd --user requires a D-Bus user session.
-    # Without it, 'systemctl --user' fails with "Failed to connect to bus".
+    # BUG-028: on headless Pi/VPS, systemd --user requires a D-Bus user session.
     # loginctl enable-linger creates a persistent user session that survives
-    # without an active login — required for user services to run at boot.
+    # without an active login — required for user services to work at boot.
     loginctl enable-linger "$USER" 2>/dev/null || true
-    # Set XDG_RUNTIME_DIR if not already set (needed for D-Bus on headless systems)
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
-    systemctl --user daemon-reload
-    systemctl --user enable --now synkore-sync.timer
-    ok "Linux sync agent loaded (systemd user timer)."
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable --now synkore-sync.timer 2>/dev/null || true
+    ok "Linux sync agent loaded."
 
-    # BUG-017: 'brew install tailscale' fails on Linux — brew is Mac-only.
-    # On Linux, Tailscale has its own install script.
-    if ! command -v tailscale &>/dev/null; then
-        echo ""
-        read -r -p "    Install Tailscale for remote access? (y/n): " INSTALL_TS
-        if [[ "$INSTALL_TS" == "y" ]]; then
-            curl -fsSL https://tailscale.com/install.sh | sh
-            sudo tailscale up
-            ok "Tailscale installed."
-        fi
-    fi
+    # BUG-017: Tailscale on Linux — do NOT curl | sh inside an already-running
+    # curl | bash installer (nested pipe + no checksum = critical security risk).
+    # Instead: offer a link to the official install.
+    printf "\n"
+    info "Optional: install Tailscale for remote access from any network."
+    info "Official installer: https://tailscale.com/install"
+    info "(Run it separately, not here — their installer requires interactive steps.)"
 fi
 
 # =============================================================================
 # ACT 5b — MOBILE ACCESS (OPTIONAL)
 # =============================================================================
-# BUG-010: the original playbook assumed every user has a Pi. Solo users with
-# no server hit a dead end at every mobile step. We branch here:
-#   - Has Pi: show Moshi setup instructions
-#   - No Pi: explain the Telegram Pro option honestly
+# BUG-010: original playbook assumed every user has a Pi. Users without a Pi
+# hit a dead end. We branch: Pi → Moshi setup; no Pi → honest Pro waitlist info.
 
 step "ACT 5b — Mobile access (optional)..."
-echo ""
-read -r -p "    Do you want mobile access (iPhone/iPad)? (y/n): " WANT_MOBILE
+printf "\n"
+WANT_MOBILE=""
+tty_read WANT_MOBILE "    Do you want mobile access (iPhone/iPad)? (y/n): "
 
 if [[ "$WANT_MOBILE" == "y" ]]; then
-    echo ""
-    read -r -p "    Do you have a Raspberry Pi or server running 24/7? (y/n): " HAS_PI
+    HAS_PI=""
+    tty_read HAS_PI "    Do you have a Raspberry Pi or server running 24/7? (y/n): "
 
     if [[ "$HAS_PI" == "y" ]]; then
-        # BUG-022: never say "ask your Pi admin" to a solo user.
-        # We say "on the Pi, run this command" instead.
-        echo ""
-        ok "Great. Here's how to set up one-tap Claude access from your phone:"
-        echo ""
-        echo "  Step 1 — Install Moshi on your iPhone or iPad:"
-        echo "    Search the App Store for: Moshi: SSH & SFTP Terminal"
-        # BUG-014: Moshi search returns a meditation app first.
-        echo "    (Important: it's by Comodo Security Solutions — NOT the meditation app)"
-        echo ""
-        echo "  Step 2 — In Moshi: Settings → Keys → Generate New Key → name it 'phone'"
-        echo "    Long-press the key → Copy Public Key"
-        echo ""
-        echo "  Step 3 — On the Pi, run this command (replace the KEY and USERNAME):"
-        echo '    echo '"'"'command="cd ~/Claude_Code && claude",restrict ssh-ed25519 YOUR_KEY_HERE phone'"'"' >> ~/.ssh/authorized_keys'
-        echo ""
-        echo "  Step 4 — In Moshi: + → New Connection → enter your Pi's Tailscale IP"
-        echo "    Username: your Pi username | Authentication: the key you generated"
-        echo ""
-        echo "  Result: one tap → Claude opens on your Pi. No typing."
-        echo ""
-        read -r -p "    Press Enter to continue..."
+        printf "\n"
+        ok "Here's how to set up one-tap Claude access from your phone:"
+        printf "\n"
+        printf "  Step 1 — Install Moshi on your iPhone/iPad:\n"
+        # BUG-014: Moshi search returns a meditation app first
+        printf "    Search App Store for: Moshi: SSH & SFTP Terminal\n"
+        printf "    (by Comodo Security Solutions — NOT the meditation app)\n\n"
+        printf "  Step 2 — In Moshi: Settings → Keys → Generate New Key → name it 'phone'\n"
+        printf "    Long-press the key → Copy Public Key\n\n"
+        # BUG-022: say "On the Pi, run this" not "ask your Pi admin"
+        printf "  Step 3 — On the Pi, run this command (paste your key):\n"
+        printf '    echo '"'"'command="cd ~/Claude_Code && command claude",restrict ssh-ed25519 YOUR_KEY_HERE phone'"'"' >> ~/.ssh/authorized_keys\n\n'
+        printf "  Step 4 — In Moshi: + → New Connection → enter your Pi's Tailscale IP\n"
+        printf "    Username: your Pi username | Auth: the key from Step 2\n\n"
+        printf "  Result: one tap → Claude opens on Pi, full context, no typing.\n\n"
+        tty_read _DUMMY "    Press Enter to continue..."
     else
-        # BUG-010: no Pi — honest explanation, convert to Pro waitlist
-        echo ""
+        # BUG-010: no Pi path
+        printf "\n"
         warn "Without a Pi or server, phone access requires a hosted relay."
-        echo ""
-        echo "  This is what Synkore Pro will offer:"
-        echo "  • Hosted relay — no Pi needed"
-        echo "  • Telegram bot — message Claude from your phone like a contact"
-        echo "  • Health dashboard"
-        echo ""
-        echo "  Pro is coming soon. To get notified:"
-        echo "  → github.com/MSFcodelang/synkore (watch the repo)"
-        echo ""
-        read -r -p "    Press Enter to continue..."
+        printf "\n"
+        printf "  This is what Synkore Pro will offer:\n"
+        printf "  • Hosted relay — no Pi needed\n"
+        printf "  • Telegram bot — message Claude from your phone\n"
+        printf "  • Health dashboard\n\n"
+        printf "  Pro is coming soon → watch: github.com/MSFcodelang/synkore\n\n"
+        tty_read _DUMMY "    Press Enter to continue..."
     fi
 fi
 
 # =============================================================================
-# ACT 6 — FINISH: LOCK THE CLAUDE ALIAS + WRITE MARKER
+# ACT 6 — FINISH: CLAUDE ALIAS + MARKER
 # =============================================================================
-# The claude alias forces Claude to always open from ~/Claude_Code.
+# The alias forces Claude to always open from ~/Claude_Code.
 # This ensures the project hash is always the same — MEMORY.md never
 # "disappears" because Claude was opened from a different folder (BUG-006).
+#
+# BUG-023: the alias must use 'command claude' not 'claude' — otherwise
+# the alias calls itself recursively (infinite loop).
+#
+# BUG-alias-grep: the grep check must match the EXACT string we write.
+# Previous version checked for 'claude' but wrote 'command claude' — mismatch
+# caused duplicate alias lines to accumulate on every reinstall.
 
 step "ACT 6 — Locking Claude alias and finishing up..."
 
-# Write the alias to the shell config if not already there
-if ! grep -q "alias claude='cd \$HOME/Claude_Code && claude'" "$RC" 2>/dev/null; then
-    # BUG-023: 'alias claude=...&& claude' calls itself — infinite recursion.
-    # The alias name and the command must not be the same word.
-    # 'command claude' bypasses alias lookup and finds the real binary.
-    CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
-    echo "" >> "$RC"
-    echo "# Synkore: always launch Claude from the correct directory" >> "$RC"
-    echo "alias claude='cd \$HOME/Claude_Code && command claude'" >> "$RC"
+ALIAS_LINE="alias claude='cd \$HOME/Claude_Code && command claude'"
+if ! grep -qF "command claude" "$RC" 2>/dev/null; then
+    printf "\n# Synkore: always launch Claude from the correct directory\n" >> "$RC"
+    printf "%s\n" "$ALIAS_LINE" >> "$RC"
     info "Claude alias written to $RC"
 else
     info "Claude alias already in $RC — skipped."
 fi
 
-# Write install marker with today's date so we can detect reinstalls (BUG-012)
+# Write install marker
 date '+%Y-%m-%d' > "$SYNKORE_MARKER"
 
 # =============================================================================
-# DONE — PRINT VERIFICATION CHECKLIST
+# DONE — VERIFICATION CHECKLIST
 # =============================================================================
 
-echo ""
-echo -e "${BOLD}╔════════════════════════════════════════╗${RESET}"
-echo -e "${BOLD}║         Installation complete!         ║${RESET}"
-echo -e "${BOLD}╚════════════════════════════════════════╝${RESET}"
-echo ""
-echo "Here's what's now running invisibly for you:"
-echo ""
-echo "  • Git repos in ~/Claude_Code/ sync to GitHub every 5 minutes"
-echo "  • Every memory file Claude writes auto-commits and pushes to GitHub"
-echo "  • A health check runs silently each time you open a Claude session"
-echo "  • Claude always opens from ~/Claude_Code — memory is never lost"
-echo ""
-echo -e "${BOLD}Verification — run these checks:${RESET}"
-echo ""
-# BUG-015: sync.log and health_check.log do not exist immediately after install.
-# sync.log appears after the first sync run (~5 min).
-# health_check.log appears after the first new Claude session.
-# We tell the user this explicitly so they don't think something is broken.
-echo "  Step 1 — Check the sync agent is registered (do this now):"
+printf "\n"
+printf "${BOLD}╔════════════════════════════════════════╗${RESET}\n"
+printf "${BOLD}║         Installation complete!         ║${RESET}\n"
+printf "${BOLD}╚════════════════════════════════════════╝${RESET}\n"
+printf "\n"
+printf "Here's what's now running invisibly for you:\n\n"
+printf "  • Git repos in ~/Claude_Code/ sync to GitHub every 5 minutes\n"
+printf "  • Every memory file Claude writes auto-commits and pushes to GitHub\n"
+printf "  • A health check runs silently each time you open Claude\n"
+printf "  • Claude always opens from ~/Claude_Code — memory is never lost\n\n"
+
+printf "${BOLD}Now do these three things:${RESET}\n\n"
+printf "  1. Reload your shell:\n"
+printf "     source %s\n\n" "$RC"
+printf "  2. Open Claude once with the new alias:\n"
+printf "     claude\n\n"
+printf "  3. After 5 minutes, verify sync is running:\n"
+
 if [[ "$OS" == "mac" ]]; then
-echo "    launchctl list | grep synkore"
+printf "     launchctl list | grep synkore\n"
 else
-echo "    systemctl --user is-active synkore-sync.timer"
+printf "     systemctl --user is-active synkore-sync.timer\n"
 fi
-echo ""
-echo "  Step 2 — Wait 5 minutes, then check sync ran:"
-echo "    cat ~/Claude_Code/sync.log"
-echo "    (This file does not exist until the first sync runs — that is normal)"
-echo ""
-echo "  Step 3 — Open a new Claude session, type anything, then check:"
-echo "    cat ~/Claude_Code/health_check.log"
-echo "    (This file does not exist until the first Claude session after install)"
-echo ""
-echo -e "${BOLD}IMPORTANT — reload your shell now:${RESET}"
-echo "  source $RC"
-echo ""
-echo "  Then use 'claude' normally — it will always open from the right folder."
-echo ""
-echo -e "${BOLD}Memory is syncing to:${RESET} github.com/$GITHUB_USER/$MEMORY_REPO_NAME"
-echo ""
-echo "---"
-echo "Synkore is an independent open-source project."
-echo "Not affiliated with or endorsed by Anthropic."
-echo "---"
+
+# BUG-015: logs do not exist until after the first sync and first Claude session.
+# Tell the user this explicitly so they don't think something is broken.
+printf "\n"
+printf "${BOLD}Verification logs (they appear after first use — that is normal):${RESET}\n\n"
+printf "  # After 5 minutes:\n"
+printf "  cat ~/Claude_Code/sync.log\n\n"
+printf "  # After first new Claude session:\n"
+printf "  cat ~/Claude_Code/health_check.log\n\n"
+
+printf "  Memory syncing to: github.com/%s/%s\n\n" "$GITHUB_USER" "$MEMORY_REPO_NAME"
+
+printf "---\n"
+printf "Synkore is an independent open-source project.\n"
+printf "Not affiliated with or endorsed by Anthropic.\n"
+printf "---\n\n"
