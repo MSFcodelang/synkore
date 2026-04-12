@@ -230,8 +230,12 @@ fi
 ok "Git identity: $GIT_NAME <$GIT_EMAIL>"
 
 # --- GitHub username (needed to name the memory repo) ---
+# BUG-030: empty username crashes everything downstream — validate before continuing
 echo ""
-read -r -p "    Your GitHub username: " GITHUB_USER
+GITHUB_USER=""
+while [[ -z "$GITHUB_USER" ]]; do
+    read -r -p "    Your GitHub username (required): " GITHUB_USER
+done
 
 # --- SSH key ---
 # We prefer ed25519 — the modern, small, fast key type.
@@ -252,30 +256,71 @@ fi
 # --- Add key to macOS Keychain so it survives reboots (BUG-005) ---
 # On Mac, ssh-add --apple-use-keychain stores the key in the system Keychain.
 # Without this, git push fails after every reboot because the SSH agent forgets.
+# BUG-027: on Linux, we also need an ssh-agent running — start one if missing.
 if [[ "$OS" == "mac" ]]; then
     eval "$(ssh-agent -s)" > /dev/null 2>&1
     ssh-add --apple-use-keychain "$SSH_KEY" 2>/dev/null || ssh-add "$SSH_KEY" 2>/dev/null || true
+else
+    # Linux: start ssh-agent if not already running, then add the key
+    if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+        eval "$(ssh-agent -s)" > /dev/null 2>&1
+    fi
+    ssh-add "$SSH_KEY" 2>/dev/null || true
 fi
 
 # --- Write ~/.ssh/config to auto-load the key on startup ---
-# UseKeychain yes = Mac Keychain keeps the key loaded permanently.
-# AddKeysToAgent yes = auto-loads into ssh-agent on first use.
+# BUG-026: UseKeychain is Mac-only. On Linux it is an unrecognized option that
+# causes SSH to print "Bad configuration option: usekeychain" on every call,
+# which breaks the ssh -T verification test and exits the script.
 SSH_CONFIG="$HOME/.ssh/config"
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
 if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
-    cat >> "$SSH_CONFIG" << EOF
+    if [[ "$OS" == "mac" ]]; then
+        cat >> "$SSH_CONFIG" << EOF
 
 Host github.com
     AddKeysToAgent yes
     UseKeychain yes
     IdentityFile $SSH_KEY
 EOF
+    else
+        cat >> "$SSH_CONFIG" << EOF
+
+Host github.com
+    AddKeysToAgent yes
+    IdentityFile $SSH_KEY
+EOF
+    fi
     chmod 600 "$SSH_CONFIG"
     info "SSH config written."
 fi
 
+# --- Pre-populate known_hosts with GitHub's host key ---
+# BUG-029: on a fresh machine, GitHub's host key is not in known_hosts.
+# ssh -T would prompt "Are you sure you want to continue connecting?" —
+# an interactive prompt that hangs or fails in a script context.
+# ssh-keyscan fetches GitHub's known fingerprint and adds it safely.
+info "Adding GitHub to known hosts..."
+mkdir -p "$HOME/.ssh"
+ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+ok "GitHub host key cached."
+
+# --- Authenticate gh CLI ---
+# BUG-024: gh is installed in ACT 1 but never authenticated.
+# gh repo view and gh repo create both fail without authentication.
+info "Checking gh authentication..."
+if ! gh auth status &>/dev/null; then
+    echo ""
+    echo "  We need to authenticate the GitHub CLI."
+    echo "  A browser window will open — log in and approve."
+    echo ""
+    gh auth login --git-protocol ssh --web
+fi
+ok "gh: authenticated"
+
 # --- Show public key and wait for GitHub confirmation ---
 echo ""
-echo -e "${BOLD}Add this key to your GitHub account:${RESET}"
+echo -e "${BOLD}Add this SSH key to your GitHub account:${RESET}"
 echo -e "  Go to: ${BOLD}github.com → Settings → SSH and GPG keys → New SSH key${RESET}"
 echo ""
 cat "${SSH_KEY}.pub"
@@ -434,19 +479,28 @@ else
     echo '{}' > "$SETTINGS"
 fi
 
+# BUG-025: the hook command strings contain quotes, escaped dollars, and
+# semicolons. If we embed them directly into a Python heredoc with an unquoted
+# delimiter (<<PYEOF), the shell expands them before Python sees them — corrupting
+# the Python source and causing a SyntaxError. The fix: write each hook command
+# to a temp file, then read it inside Python using os.environ or open().
+# We use environment variables — Python reads them as plain strings, zero expansion.
+
 # The PostToolUse hook command.
 # It does three things:
 #   1. Reads the file path from Claude's tool output using jq
 #   2. Checks if the file is inside a memory folder
 #   3. If yes: git add, commit, push to GitHub
-MEMORY_HOOK_CMD="jq -r '.tool_input.file_path // empty' | { read -r f; echo \"\$f\" | grep -qE '.claude/projects/.+/memory' || exit 0; REPO=\$(dirname \"\$f\"); while [ \"\$REPO\" != \"/\" ] && [ ! -d \"\$REPO/.git\" ]; do REPO=\$(dirname \"\$REPO\"); done; [ -d \"\$REPO/.git\" ] || exit 0; cd \"\$REPO\" 2>/dev/null || exit 0; git add . && git commit -m \"Auto-sync memory \$(date '+%Y-%m-%d %H:%M')\" && git push; } 2>/dev/null || true"
+export SYNKORE_MEMORY_HOOK="jq -r '.tool_input.file_path // empty' | { read -r f; echo \"\$f\" | grep -qE '.claude/projects/.+/memory' || exit 0; REPO=\$(dirname \"\$f\"); while [ \"\$REPO\" != \"/\" ] && [ ! -d \"\$REPO/.git\" ]; do REPO=\$(dirname \"\$REPO\"); done; [ -d \"\$REPO/.git\" ] || exit 0; cd \"\$REPO\" 2>/dev/null || exit 0; git add . && git commit -m \"Auto-sync memory \$(date '+%Y-%m-%d %H:%M')\" && git push; } 2>/dev/null || true"
 
-# The UserPromptSubmit hook — runs health check silently at session start
-HEALTH_HOOK_CMD="bash $HOME/Claude_Code/health_check.sh >> /dev/null 2>&1 &"
+# The UserPromptSubmit hook — runs health check silently at session start.
+# $HOME is expanded here in the shell (correct) not inside Python (safe).
+export SYNKORE_HEALTH_HOOK="bash $HOME/Claude_Code/health_check.sh >> /dev/null 2>&1 &"
 
 # Merge hooks into settings.json using python3.
-# We check if our hook is already in the array before appending.
-python3 - <<PYEOF
+# We use a QUOTED heredoc ('PYEOF') so the shell does NOT expand anything inside.
+# Python reads the hook commands from environment variables — clean string values.
+python3 - <<'PYEOF'
 import json, os
 
 path = os.path.expanduser("~/.claude/settings.json")
@@ -455,13 +509,17 @@ with open(path) as f:
 
 hooks = cfg.setdefault("hooks", {})
 
+# Read hook commands from environment — passed as plain strings, never shell-expanded
+memory_cmd = os.environ["SYNKORE_MEMORY_HOOK"]
+health_cmd  = os.environ["SYNKORE_HEALTH_HOOK"]
+
 # --- PostToolUse hook ---
 post_hooks = hooks.setdefault("PostToolUse", [])
 memory_hook = {
     "matcher": "Write",
     "hooks": [{
         "type": "command",
-        "command": """$MEMORY_HOOK_CMD""",
+        "command": memory_cmd,
         "timeout": 120,
         "statusMessage": "Syncing memory..."
     }]
@@ -482,7 +540,7 @@ health_hook = {
     "matcher": "",
     "hooks": [{
         "type": "command",
-        "command": """$HEALTH_HOOK_CMD"""
+        "command": health_cmd
     }]
 }
 already_has_health_hook = any(
@@ -703,6 +761,15 @@ OnUnitActiveSec=300
 WantedBy=timers.target
 EOF
 
+    # BUG-028: on headless Pi / VPS, systemd --user requires a D-Bus user session.
+    # Without it, 'systemctl --user' fails with "Failed to connect to bus".
+    # loginctl enable-linger creates a persistent user session that survives
+    # without an active login — required for user services to run at boot.
+    loginctl enable-linger "$USER" 2>/dev/null || true
+    # Set XDG_RUNTIME_DIR if not already set (needed for D-Bus on headless systems)
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
     systemctl --user daemon-reload
     systemctl --user enable --now synkore-sync.timer
     ok "Linux sync agent loaded (systemd user timer)."
@@ -787,9 +854,13 @@ step "ACT 6 — Locking Claude alias and finishing up..."
 
 # Write the alias to the shell config if not already there
 if ! grep -q "alias claude='cd \$HOME/Claude_Code && claude'" "$RC" 2>/dev/null; then
+    # BUG-023: 'alias claude=...&& claude' calls itself — infinite recursion.
+    # The alias name and the command must not be the same word.
+    # 'command claude' bypasses alias lookup and finds the real binary.
+    CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
     echo "" >> "$RC"
     echo "# Synkore: always launch Claude from the correct directory" >> "$RC"
-    echo "alias claude='cd \$HOME/Claude_Code && claude'" >> "$RC"
+    echo "alias claude='cd \$HOME/Claude_Code && command claude'" >> "$RC"
     info "Claude alias written to $RC"
 else
     info "Claude alias already in $RC — skipped."
