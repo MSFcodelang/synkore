@@ -111,9 +111,14 @@ else
 fi
 
 # Detect shell config file (BUG-018: never assume zshrc on all systems)
+# BUG-bashrc: on macOS, bash login shells read ~/.bash_profile NOT ~/.bashrc.
+# Terminal.app opens login shells. ~/.bashrc is never sourced automatically.
+# Writing the alias there means it vanishes in every new Terminal window.
 RC=""
 if [[ "$SHELL" == */zsh ]]; then
     RC="$HOME/.zshrc"
+elif [[ "$OS" == "mac" ]]; then
+    RC="$HOME/.bash_profile"
 else
     RC="$HOME/.bashrc"
 fi
@@ -128,7 +133,7 @@ fi
 _PYTHON3=""
 for _py in python3 python3.12 python3.11 python3.10 python3.9; do
     if command -v "$_py" &>/dev/null; then
-        if "$_py" -c "import sys; sys.exit(0 if sys.version_info.major == 3 else 1)" 2>/dev/null; then
+        if "$_py" -c "import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)" 2>/dev/null; then
             _PYTHON3="$_py"
             break
         fi
@@ -225,10 +230,18 @@ ok "git: $(git --version)"
 if ! command -v jq &>/dev/null; then
     warn "jq not installed — installing now..."
     if [[ "$OS" == "mac" ]]; then
+        # BUG-homebrew: auto-install Homebrew if absent — one-command promise requires it.
+        # After install, eval shellenv to add /opt/homebrew/bin (Apple Silicon) or
+        # /usr/local/bin (Intel) to the current shell session's PATH.
         if ! command -v brew &>/dev/null; then
-            fail "Homebrew is required to install jq on Mac."
-            info "Install Homebrew: https://brew.sh — then re-run this installer."
-            exit 1
+            info "Homebrew not found — installing Homebrew first..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty
+            # Make Homebrew available in the current session immediately
+            if [[ "$(uname -m)" == "arm64" ]]; then
+                eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true
+            else
+                eval "$(/usr/local/bin/brew shellenv)" 2>/dev/null || true
+            fi
         fi
         brew install jq
     else
@@ -340,11 +353,16 @@ else
 fi
 
 # --- SSH config (BUG-026: UseKeychain is mac-only — kills Linux SSH if written there) ---
+# BUG-port22: corporate firewalls often block port 22. GitHub supports SSH over port 443
+# via ssh.github.com. Setting Hostname+Port here means SSH uses 443 transparently —
+# works everywhere port 22 works, AND works when port 22 is blocked.
 if ! grep -q "Host github.com" "$HOME/.ssh/config" 2>/dev/null; then
     if [[ "$OS" == "mac" ]]; then
         cat >> "$HOME/.ssh/config" << EOF
 
 Host github.com
+    Hostname ssh.github.com
+    Port 443
     AddKeysToAgent yes
     UseKeychain yes
     IdentityFile $SSH_KEY
@@ -354,13 +372,15 @@ EOF
         cat >> "$HOME/.ssh/config" << EOF
 
 Host github.com
+    Hostname ssh.github.com
+    Port 443
     AddKeysToAgent yes
     IdentityFile $SSH_KEY
     ConnectTimeout 30
 EOF
     fi
     chmod 600 "$HOME/.ssh/config"
-    info "SSH config written."
+    info "SSH config written (using port 443 — works on all networks including corporate)."
 fi
 
 # --- GitHub host key verification (BUG-029) ---
@@ -405,25 +425,66 @@ cat "${SSH_KEY}.pub"
 printf "\n"
 tty_read _DUMMY "Press Enter once you have added the key to GitHub: "
 
-# --- Verify SSH works ---
+# --- Verify SSH works — retry loop + account mismatch check ---
+# BUG-ssh-timing: key propagation on GitHub can take 5-30 seconds. One premature
+# Enter → full reinstall. Fix: 3 attempts, 10 seconds apart.
+# BUG-ssh-account: if ~/.ssh/id_ed25519 belongs to a DIFFERENT GitHub account,
+# SSH succeeds but "Hi <wrong_user>!" — hook is silently wired to an unwritable remote.
 info "Verifying connection to GitHub..."
-if safe_timeout 30 ssh -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 \
-    | grep -q "successfully authenticated"; then
-    ok "GitHub: authenticated as $GITHUB_USER"
-else
-    fail "Could not authenticate with GitHub."
+_SSH_OK=false
+_SSH_USER=""
+for _attempt in 1 2 3; do
+    _SSH_OUT=$(safe_timeout 30 ssh -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 || true)
+    if printf '%s' "$_SSH_OUT" | grep -q "successfully authenticated"; then
+        _SSH_OK=true
+        _SSH_USER=$(printf '%s' "$_SSH_OUT" | grep -oE 'Hi [^!]+' | sed 's/Hi //' || true)
+        break
+    fi
+    if [[ "$_attempt" -lt 3 ]]; then
+        warn "Not authenticated yet — retrying in 10s (attempt $_attempt/3)..."
+        sleep 10
+    fi
+done
+
+if [[ "$_SSH_OK" == "false" ]]; then
+    fail "Could not authenticate with GitHub after 3 attempts."
     info "Make sure the key above is added to your GitHub account, then re-run."
     exit 1
 fi
 
+# Verify the key belongs to the right account
+if [[ -n "$_SSH_USER" ]] && [[ "$_SSH_USER" != "$GITHUB_USER" ]]; then
+    fail "SSH key belongs to GitHub account '$_SSH_USER', not '$GITHUB_USER'."
+    info "Either use the correct GitHub username above, or delete ~/.ssh/id_ed25519 and re-run."
+    exit 1
+fi
+ok "GitHub SSH: authenticated as ${_SSH_USER:-$GITHUB_USER}"
+
 # --- Authenticate gh CLI (BUG-024: gh installed but never authenticated) ---
+# BUG-gh-hang: gh auth status calls api.github.com. Corporate firewalls that block
+# api.github.com cause gh to hang indefinitely (TCP drop, no RST). Must use safe_timeout
+# on EVERY gh call. Check API reachability before attempting web auth.
 info "Checking gh authentication..."
-if ! gh auth status &>/dev/null; then
+if ! safe_timeout 15 gh auth status &>/dev/null; then
+    # Pre-check: is api.github.com reachable at all?
+    if ! curl --max-time 8 --connect-timeout 5 -sf https://api.github.com/zen &>/dev/null; then
+        fail "api.github.com is not reachable (firewall or network issue)."
+        info "gh CLI requires api.github.com for authentication."
+        info "On corporate networks: check if api.github.com is blocked."
+        info "Alternative: create a Personal Access Token at github.com/settings/tokens"
+        info "Then run: gh auth login --with-token"
+        exit 1
+    fi
     printf "\n"
     info "The GitHub CLI needs to authenticate."
     info "A browser window will open — log in and approve."
+    info "If the browser does not open, copy the URL printed below."
     printf "\n"
-    gh auth login --git-protocol ssh --web </dev/tty
+    safe_timeout 120 gh auth login --git-protocol ssh --web </dev/tty || {
+        fail "gh authentication timed out or failed."
+        info "Run 'gh auth login --git-protocol ssh --web' manually, then re-run this installer."
+        exit 1
+    }
 fi
 ok "gh: authenticated"
 
@@ -445,13 +506,22 @@ MEMORY_REPO_NAME="synkore-memory"
 MEMORY_REMOTE="git@github.com:${GITHUB_USER}/${MEMORY_REPO_NAME}.git"
 
 # Create or verify the GitHub memory repo
-if gh repo view "$GITHUB_USER/$MEMORY_REPO_NAME" &>/dev/null; then
+# BUG-gh-hang: all gh calls need safe_timeout — api.github.com can hang on firewalls.
+# BUG-gh-silent: removing 2>/dev/null — silent failures leave partial state and
+# produce cryptic downstream errors (git push to non-existent remote).
+if safe_timeout 15 gh repo view "$GITHUB_USER/$MEMORY_REPO_NAME" &>/dev/null; then
     info "Memory repo already exists on GitHub."
     _REPO_EXISTS=true
 else
     info "Creating private memory repo on GitHub..."
-    gh repo create "$GITHUB_USER/$MEMORY_REPO_NAME" \
-        --private --description "Synkore memory sync" 2>/dev/null
+    if ! safe_timeout 15 gh repo create "$GITHUB_USER/$MEMORY_REPO_NAME" \
+        --private --description "Synkore memory sync"; then
+        fail "Could not create memory repo on GitHub."
+        info "Possible causes: auth scope issue, rate limit, or api.github.com unreachable."
+        info "Create manually: gh repo create $MEMORY_REPO_NAME --private"
+        info "Then re-run this installer."
+        exit 1
+    fi
     ok "Created: github.com/$GITHUB_USER/$MEMORY_REPO_NAME"
     _REPO_EXISTS=false
 fi
@@ -498,8 +568,14 @@ EOF
     git -C "$_MEM_STAGING" add .
     git -C "$_MEM_STAGING" commit -m "Synkore: initial memory setup"
     git -C "$_MEM_STAGING" remote add origin "$MEMORY_REMOTE"
-    # First push to a new empty repo — no force flags needed
-    git -C "$_MEM_STAGING" push -u origin main
+    # BUG-git-timeout: git push/pull have no built-in timeout. On slow networks or
+    # stalled SSH handshakes they hang indefinitely. Wrap in safe_timeout.
+    if ! safe_timeout 60 git -C "$_MEM_STAGING" push -u origin main; then
+        fail "Could not push starter files to GitHub (timeout or network error)."
+        info "The repo was created on GitHub. Re-run to complete setup."
+        rm -rf "$_MEM_STAGING"
+        exit 1
+    fi
     ok "Starter files pushed to GitHub memory repo."
 
     # Clean up staging dir — the self-healing hook sets up the local repo
@@ -543,7 +619,13 @@ fi
 # PostToolUse hook: uses full $JQ_PATH (baked at install) and the GitHub username.
 # The hook self-heals: if the memory dir has no .git, it initializes one,
 # fetches the existing MEMORY.md from GitHub, then commits and pushes.
-export SYNKORE_MEMORY_HOOK="${JQ_PATH} -r '.tool_input.file_path // empty' | { read -r f; echo \"\$f\" | grep -qE '.claude/projects/.+/memory' || exit 0; D=\$(dirname \"\$f\"); if [ ! -d \"\$D/.git\" ]; then git -C \"\$D\" init 2>/dev/null && git -C \"\$D\" remote add origin git@github.com:${GITHUB_USER}/${MEMORY_REPO_NAME}.git 2>/dev/null && git -C \"\$D\" fetch origin main 2>/dev/null && (git -C \"\$D\" checkout -b main --track origin/main 2>/dev/null || git -C \"\$D\" checkout main 2>/dev/null || true); fi; cd \"\$D\" || exit 0; git add . && git commit -m \"Auto-sync memory \$(date '+%Y-%m-%d %H:%M')\" && git push; } 2>/dev/null || true"
+# Memory hook — key fixes applied:
+# BUG-hook-empty:  explicit [ -z "$f" ] check before grep (read returns 1 on empty jq output)
+# BUG-hook-regex:  \.claude (escaped dot), trailing slash, [^/]+ (no path traversal)
+# BUG-hook-master: dynamic branch detection via ls-remote, not hardcoded 'main'
+# BUG-hook-diverge: git pull --rebase before push — prevents permanent diverged history
+#                   when concurrent hook instances create split push histories
+export SYNKORE_MEMORY_HOOK="${JQ_PATH} -r '.tool_input.file_path // empty' | { read -r f || true; [ -z \"\$f\" ] && exit 0; echo \"\$f\" | grep -qE '\\.claude/projects/[^/]+/memory/' || exit 0; D=\$(dirname \"\$f\"); if [ ! -d \"\$D/.git\" ]; then git -C \"\$D\" init 2>/dev/null && git -C \"\$D\" remote add origin git@github.com:${GITHUB_USER}/${MEMORY_REPO_NAME}.git 2>/dev/null && git -C \"\$D\" fetch origin 2>/dev/null; B=\$(git -C \"\$D\" ls-remote --symref origin HEAD 2>/dev/null | grep '^ref:' | sed 's|ref: refs/heads/||;s|[[:space:]].*||'); B=\${B:-main}; git -C \"\$D\" checkout -b \"\$B\" --track \"origin/\$B\" 2>/dev/null || git -C \"\$D\" checkout \"\$B\" 2>/dev/null || true; fi; cd \"\$D\" || exit 0; B=\$(git rev-parse --abbrev-ref HEAD 2>/dev/null); B=\${B:-main}; git pull --rebase origin \"\$B\" 2>/dev/null || true; git add . && git commit -m \"Auto-sync memory \$(date '+%Y-%m-%d %H:%M')\" && git push origin \"\$B\"; } 2>/dev/null || true"
 
 # UserPromptSubmit hook: runs health check silently at session start
 export SYNKORE_HEALTH_HOOK="bash $HOME/Claude_Code/health_check.sh >> /dev/null 2>&1 &"
@@ -770,22 +852,38 @@ if [[ "$OS" == "mac" ]]; then
 </dict>
 </plist>
 EOF
+    # BUG-reinstall-plist: on reinstall, the old plist is still loaded.
+    # bootstrap on an already-loaded service returns EALREADY (exit 37) and is silently
+    # swallowed — the OLD running agent keeps using stale config. Bootout first.
+    launchctl bootout "gui/$(id -u)/com.synkore.sync" 2>/dev/null || \
+        launchctl unload "$PLIST" 2>/dev/null || true
+
     # BUG-013: use modern bootstrap, fallback to load for older macOS
     launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || \
         launchctl load "$PLIST" 2>/dev/null || true
 
-    # BUG-009: MDM may silently block LaunchAgents — verify and offer cron fallback
-    sleep 3
-    if ! launchctl list 2>/dev/null | grep -qE "com\.synkore\.sync" && \
-       ! launchctl print "gui/$(id -u)/com.synkore.sync" &>/dev/null 2>&1; then
-        warn "Sync agent may be blocked (MDM). Installing cron fallback..."
-        # BUG-035: deduplicate; BUG-env-9: quote $HOME path for spaces
-        ( crontab -l 2>/dev/null | grep -v "msf_sync.sh";
-          printf '*/5 * * * * bash "%s/Claude_Code/msf_sync.sh" >> "%s/Claude_Code/sync.log" 2>&1\n' \
-              "$HOME" "$HOME" ) | crontab -
-        info "Cron fallback installed."
+    # BUG-009/MDM: MDM can silently accept then kill the agent. launchctl list
+    # shows the service name even when MDM-blocked. More reliable check: verify
+    # that RunAtLoad actually produced a sync.log entry within the window.
+    # Also increase window to 10s — MDM enforcement is asynchronous (5-15s delay).
+    _SYNC_AGENT_OK=false
+    sleep 10
+    if [[ -f "$HOME/Claude_Code/sync.log" ]]; then
+        _SYNC_AGENT_OK=true
     fi
-    ok "Mac sync agent loaded."
+    if [[ "$_SYNC_AGENT_OK" == "false" ]]; then
+        warn "Sync agent blocked or not running (MDM policy?). Installing cron fallback..."
+        # BUG-crontab-sete: crontab -  returns non-zero on managed Macs (Full Disk Access
+        # required). Wrap in || warn to prevent set -e from killing the script here.
+        # BUG-035: deduplicate cron entry on reinstall.
+        ( crontab -l 2>/dev/null | grep -v "msf_sync.sh";
+          printf '*/5 * * * * /bin/bash "%s/Claude_Code/msf_sync.sh" >> "%s/Claude_Code/sync.log" 2>&1\n' \
+              "$HOME" "$HOME" ) | crontab - 2>/dev/null || \
+            warn "Cron install failed — Terminal may need Full Disk Access in System Settings → Privacy."
+        ok "Cron fallback installed (syncs every 5 minutes)."
+    else
+        ok "Mac sync agent loaded (launchd)."
+    fi
 
 else
     # BUG-016: Linux uses systemd user units, not launchd
@@ -877,8 +975,10 @@ fi
 
 step "ACT 6 — Locking Claude alias..."
 
-# Pattern: check for the full alias structure, not just 'command claude'
-if ! grep -qF "cd \$HOME/Claude_Code && command claude" "$RC" 2>/dev/null; then
+# BUG-alias-grep: grep -qF with literal "$HOME" does NOT match the stored literal "$HOME"
+# in the file (grep expands $HOME to /Users/username; file has literal $HOME).
+# Fix: use -qE with a regex pattern that matches any form of the alias.
+if ! grep -qE "alias claude=.*command claude" "$RC" 2>/dev/null; then
     printf "\n# Synkore: always launch Claude from the correct directory\n" >> "$RC"
     printf "alias claude='cd \$HOME/Claude_Code && command claude'\n" >> "$RC"
     info "Claude alias written to $RC"
