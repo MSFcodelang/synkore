@@ -76,23 +76,15 @@ cat ~/Claude_Code/health_check.log
 
 ## Uninstall
 
-Everything the installer does can be undone:
+One command. Clean removal. Nothing left behind.
 
 ```bash
-# Stop sync agent (Mac)
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.synkore.sync.plist
-
-# Stop sync agent (Linux)
-systemctl --user disable --now synkore-sync.timer
-
-# Remove hooks from Claude settings
-# Edit ~/.claude/settings.json — remove the PostToolUse and UserPromptSubmit blocks
-
-# Remove the alias from ~/.zshrc or ~/.bashrc
-# (the line that says: alias claude='cd $HOME/Claude_Code && claude')
-
-# Delete the memory repo on GitHub if you want (optional — it's just a private repo)
+curl -fsSL https://raw.githubusercontent.com/MSFcodelang/synkore/main/uninstall.sh | bash
 ```
+
+This removes: sync agent, Claude hooks, shell alias, Synkore scripts.
+
+This does NOT remove: your repos in `~/Claude_Code/`, your SSH key, your memory files, your GitHub memory repo (it's private and yours — delete it manually if you want: `gh repo delete synkore-memory --yes`).
 
 ---
 
