@@ -95,6 +95,14 @@ safe_timeout() {
     fi
 }
 
+# BUG-043: Docker/root detection — sudo is not available when running as root.
+# Use direct commands instead. All install commands go through RUN_AS_ROOT.
+if [[ "$(id -u)" == "0" ]]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
 # =============================================================================
 # ACT 0a — OS AND SHELL DETECTION
 # =============================================================================
@@ -216,7 +224,7 @@ if ! command -v git &>/dev/null; then
         xcode-select --install 2>/dev/null || true
         tty_read _DUMMY "    Press Enter only after Xcode tools installation is complete: "
     else
-        sudo apt-get update -qq && sudo apt-get install -y -qq git
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq git
     fi
 fi
 ok "git: $(git --version)"
@@ -245,7 +253,7 @@ if ! command -v jq &>/dev/null; then
         fi
         brew install jq
     else
-        sudo apt-get update -qq && sudo apt-get install -y -qq jq
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq jq
     fi
 fi
 JQ_PATH=$(command -v jq)   # full path — baked into hook command below
@@ -253,7 +261,7 @@ ok "jq: $JQ_PATH"
 
 # --- curl ---
 if ! command -v curl &>/dev/null; then
-    [[ "$OS" == "linux" ]] && sudo apt-get install -y -qq curl
+    [[ "$OS" == "linux" ]] && $SUDO apt-get install -y -qq curl
 fi
 ok "curl: present"
 
@@ -274,20 +282,35 @@ if ! command -v gh &>/dev/null; then
             rm -f "$_GPG_TMP"
             exit 1
         fi
-        sudo dd if="$_GPG_TMP" of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        $SUDO dd if="$_GPG_TMP" of=/usr/share/keyrings/githubcli-archive-keyring.gpg
         rm -f "$_GPG_TMP"
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-            | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-        sudo apt-get update -qq && sudo apt-get install -y -qq gh
+            | $SUDO tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        $SUDO apt-get update -qq && $SUDO apt-get install -y -qq gh
     fi
 fi
 ok "gh: $(gh --version | head -1)"
 
 # --- Claude Code ---
+# BUG-044: Ubuntu apt ships Node 12 which is too old (Claude Code needs Node 18+).
+# Install Node 20 from NodeSource if node is missing or too old, then install claude.
 if ! command -v claude &>/dev/null; then
-    fail "Claude Code is not installed."
-    info "Install it: https://claude.ai/code — then re-run."
-    exit 1
+    if [[ "$OS" == "linux" ]]; then
+        info "Claude Code not found — installing..."
+        # Check Node version
+        _NODE_VER=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1 || echo 0)
+        if [[ "$_NODE_VER" -lt 18 ]]; then
+            info "Node.js $_NODE_VER is too old (need 18+) — installing Node 20 from NodeSource..."
+            $SUDO apt-get remove -y libnode-dev libnode72 nodejs npm 2>/dev/null || true
+            curl -fsSL https://deb.nodesource.com/setup_20.x </dev/null | $SUDO bash -
+            $SUDO apt-get install -y nodejs
+        fi
+        npm install -g @anthropic-ai/claude-code
+    else
+        fail "Claude Code is not installed."
+        info "Install it: https://claude.ai/code — then re-run."
+        exit 1
+    fi
 fi
 ok "Claude Code: present"
 
@@ -295,7 +318,7 @@ ok "Claude Code: present"
 if [[ -z "$_PYTHON3" ]]; then
     fail "Python 3 is required but not found (or 'python3' points to Python 2)."
     [[ "$OS" == "mac" ]] && info "brew install python3"
-    [[ "$OS" == "linux" ]] && info "sudo apt-get install python3"
+    [[ "$OS" == "linux" ]] && info "$SUDO apt-get install python3"
     exit 1
 fi
 ok "Python 3: $($_PYTHON3 --version)"
@@ -434,7 +457,7 @@ info "Verifying connection to GitHub..."
 _SSH_OK=false
 _SSH_USER=""
 for _attempt in 1 2 3; do
-    _SSH_OUT=$(safe_timeout 30 ssh -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 || true)
+    _SSH_OUT=$(safe_timeout 30 ssh -o StrictHostKeyChecking=accept-new -T git@github.com </dev/null 2>&1 || true)
     if printf '%s' "$_SSH_OUT" | grep -q "successfully authenticated"; then
         _SSH_OK=true
         _SSH_USER=$(printf '%s' "$_SSH_OUT" | grep -oE 'Hi [^!]+' | sed 's/Hi //' || true)
