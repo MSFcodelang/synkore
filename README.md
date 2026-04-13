@@ -44,6 +44,20 @@ curl -fsSL https://raw.githubusercontent.com/MSFcodelang/synkore/main/install.sh
 
 ---
 
+## What is GitHub and why do you need it?
+
+GitHub is a free service that stores files online — like Google Drive, but for code and text files. It's used by over 100 million people, from professional engineers to writers and researchers.
+
+**For Synkore, GitHub does one thing: it holds a backup of your Claude memory.**
+
+Every time Claude learns something about you — your preferences, your projects, your working style — that memory gets saved to a private GitHub repository that only you can access. When you open Claude on a different device, it pulls that memory down automatically. That's how it remembers you everywhere.
+
+**You don't need to know anything about code to use GitHub with Synkore.** The installer handles everything. You just need a free account.
+
+→ Create one at [github.com](https://github.com) — takes 2 minutes. Free forever for private repos.
+
+---
+
 ## What gets installed
 
 | Component | What it does |
