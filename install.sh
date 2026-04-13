@@ -517,7 +517,8 @@ if ! safe_timeout 15 gh auth status &>/dev/null; then
     info "A browser window will open — log in and approve."
     info "If the browser does not open, copy the URL printed below."
     printf "\n"
-    safe_timeout 120 gh auth login --git-protocol ssh --web --skip-ssh-key </dev/tty || {
+    # BUG-048: curl|bash pipe blocks stdin. Force all gh I/O directly to terminal.
+    gh auth login --git-protocol ssh --web --skip-ssh-key </dev/tty >/dev/tty 2>/dev/tty || {
         fail "gh authentication timed out or failed."
         info "Run 'gh auth login --git-protocol ssh --web' manually, then re-run this installer."
         exit 1
