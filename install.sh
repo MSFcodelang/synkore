@@ -942,7 +942,7 @@ OnUnitActiveSec=300
 WantedBy=timers.target
 EOF
     # BUG-028: headless Pi/VPS needs linger to keep user units alive without login
-    loginctl enable-linger "$USER" 2>/dev/null || true
+    loginctl enable-linger "${USER:-$(id -un)}" 2>/dev/null || true
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
