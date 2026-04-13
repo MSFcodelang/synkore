@@ -643,6 +643,7 @@ if [[ -f "$SETTINGS" ]]; then
     cp "$SETTINGS" "${SETTINGS}.bak.$(date +%s)"
     info "Backed up settings.json"
 else
+    mkdir -p "$HOME/.claude"
     printf '{}' > "$SETTINGS"
 fi
 
