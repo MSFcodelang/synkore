@@ -1060,7 +1060,7 @@ printf "  cat ~/Claude_Code/health_check.log  # after first Claude session\n\n"
 
 printf "  Memory repo: github.com/%s/%s\n\n" "$GITHUB_USER" "$MEMORY_REPO_NAME"
 
-printf "---\n"
+printf "%s\n" "---"
 printf "Synkore — independent open-source project.\n"
 printf "Not affiliated with or endorsed by Anthropic.\n"
-printf "---\n\n"
+printf "%s\n\n" "---"
