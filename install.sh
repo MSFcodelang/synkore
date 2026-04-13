@@ -317,9 +317,11 @@ ok "Claude Code: present"
 # --- Python 3 ---
 # BUG-046: Re-evaluate _PYTHON3 here — NodeSource/Node install may have brought
 # in python3 as a dependency after ACT 0b ran and set _PYTHON3="".
+# hash -r clears bash's command cache so newly installed binaries are visible.
 if [[ -z "$_PYTHON3" ]]; then
+    hash -r 2>/dev/null || true
     for _py in python3 python3.12 python3.11 python3.10 python3.9; do
-        if command -v "$_py" &>/dev/null; then
+        if type -P "$_py" &>/dev/null; then
             if "$_py" -c "import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)" 2>/dev/null; then
                 _PYTHON3="$_py"
                 break
