@@ -343,25 +343,17 @@ ok "Python 3: $($_PYTHON3 --version)"
 
 step "ACT 2 — Setting up GitHub authentication..."
 
-# --- Git identity ---
-GIT_NAME=$(git config --global user.name 2>/dev/null || true)
-GIT_EMAIL=$(git config --global user.email 2>/dev/null || true)
-if [[ -z "$GIT_NAME" ]]; then
-    tty_read GIT_NAME "    Your name (for git commits): "
-    git config --global user.name "$GIT_NAME"
-fi
-if [[ -z "$GIT_EMAIL" ]]; then
-    tty_read GIT_EMAIL "    Your email (for git commits): "
-    git config --global user.email "$GIT_EMAIL"
-fi
-ok "Git identity: $GIT_NAME <$GIT_EMAIL>"
-
-# --- GitHub username (BUG-030: validate — empty crashes everything downstream) ---
+# --- GitHub username (needed for SSH key comment before gh auth) ---
+# BUG-049: name/email asked upfront but arrow keys don't work in Docker terminals.
+# Fix: ask only username here (short, no typos), pull name+email from gh API after auth.
 printf "\n"
-GITHUB_USER=""
-while [[ -z "$GITHUB_USER" ]]; do
-    tty_read GITHUB_USER "    Your GitHub username (required): "
-done
+GITHUB_USER=$(git config --global github.user 2>/dev/null || true)
+if [[ -z "$GITHUB_USER" ]]; then
+    GITHUB_USER=""
+    while [[ -z "$GITHUB_USER" ]]; do
+        tty_read GITHUB_USER "    Your GitHub username (required): "
+    done
+fi
 
 # --- SSH key ---
 SSH_KEY="$HOME/.ssh/id_ed25519"
@@ -672,9 +664,13 @@ export SYNKORE_HEALTH_HOOK="bash $HOME/Claude_Code/health_check.sh >> /dev/null 
 import json, os, sys
 
 path = os.path.expanduser("~/.claude/settings.json")
+# BUG-050: ~/.claude/ may not exist on a fresh install (Claude never run yet).
+os.makedirs(os.path.dirname(path), exist_ok=True)
 try:
     with open(path) as f:
         cfg = json.load(f)
+except FileNotFoundError:
+    cfg = {}
 except json.JSONDecodeError as e:
     print(f"ERROR: settings.json is invalid JSON: {e}")
     print("Fix: validate the file at jsonlint.com, then re-run.")
