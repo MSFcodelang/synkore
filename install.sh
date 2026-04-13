@@ -315,6 +315,18 @@ fi
 ok "Claude Code: present"
 
 # --- Python 3 ---
+# BUG-046: Re-evaluate _PYTHON3 here — NodeSource/Node install may have brought
+# in python3 as a dependency after ACT 0b ran and set _PYTHON3="".
+if [[ -z "$_PYTHON3" ]]; then
+    for _py in python3 python3.12 python3.11 python3.10 python3.9; do
+        if command -v "$_py" &>/dev/null; then
+            if "$_py" -c "import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)" 2>/dev/null; then
+                _PYTHON3="$_py"
+                break
+            fi
+        fi
+    done
+fi
 if [[ -z "$_PYTHON3" ]]; then
     fail "Python 3 is required but not found (or 'python3' points to Python 2)."
     [[ "$OS" == "mac" ]] && info "brew install python3"
