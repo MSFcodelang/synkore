@@ -55,4 +55,54 @@ All bugs found during install.sh testing. Format: BUG-NNN, status, root cause, f
 
 ---
 
+## BUG-048 — gh auth login Enter press ignored in curl|bash ✅ FIXED
+
+**Status:** Fixed 2026-04-13
+**Environment:** curl|bash pipe, Docker
+**Symptom:** After GitHub device auth in browser, pressing Enter in terminal did nothing. Process hung.
+**Root cause:** `gh auth login --web` reads stdin for confirmation. In curl|bash, stdin is the pipe (EOF). `</dev/tty` on stdin alone wasn't enough — stdout/stderr also needed to be on the TTY.
+**Fix:** `gh auth login ... </dev/tty >/dev/tty 2>/dev/tty` — all I/O forced directly to terminal.
+
+---
+
+## BUG-049 — name/email prompts unusable in Docker terminal ✅ FIXED
+
+**Status:** Fixed 2026-04-13
+**Environment:** Docker, any terminal where arrow keys don't work
+**Symptom:** Typing email address with a typo — no way to correct it. Arrow keys output `^[[D` escape codes. Backspace partially worked but cursor didn't move.
+**Root cause:** bash `read` has no cursor movement support. Docker pseudo-TTY doesn't translate arrow key sequences.
+**Fix:** Removed name/email prompts from ACT 2. Pull from GitHub API after gh auth: `gh api user -q .name/.email`. Only prompt as fallback if API returns empty.
+
+---
+
+## BUG-050 — ~/.claude/ directory missing on fresh install ✅ FIXED
+
+**Status:** Fixed 2026-04-13
+**Environment:** Any system where Claude Code was just installed (never run yet)
+**Symptom:** `bash: /root/.claude/settings.json: No such file or directory`
+**Root cause:** Claude Code creates `~/.claude/` on first run. Installer writes settings.json before Claude has ever been run.
+**Fix:** `mkdir -p "$HOME/.claude"` before writing settings.json.
+
+---
+
+## BUG-051 — USER unbound variable in Docker ✅ FIXED
+
+**Status:** Fixed 2026-04-13
+**Environment:** Docker (Ubuntu 22.04), possibly other minimal Linux environments
+**Symptom:** `bash: USER: unbound variable` in ACT 5 Linux sync agent block.
+**Root cause:** `set -u` is active. Docker root environment doesn't set the `USER` env var.
+**Fix:** `_CURRENT_USER=$(id -un 2>/dev/null || echo root)` — derive user from `id` instead of env var.
+
+---
+
+## BUG-052 — printf "---" parsed as option flag ✅ FIXED
+
+**Status:** Fixed 2026-04-13
+**Environment:** bash builtin printf (any system)
+**Symptom:** `printf: --: invalid option` at the very last line of the script, after "Installation complete!" already printed. Cosmetic only.
+**Root cause:** `printf "---\n"` — bash's builtin printf tries to parse leading `-` in the format string as option flags. `--` triggers "end of options" handling.
+**Fix:** `printf "%s\n" "---"` — pass `---` as an argument to `%s` format, not as the format string itself.
+
+---
+
 *Log new bugs as BUG-NNN in sequence. Mark fixed with date.*
