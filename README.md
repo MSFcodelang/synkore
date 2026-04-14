@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/MSFcodelang/synkore/main/install.sh
 
 ## Requirements
 
-- [Claude Code](https://claude.ai/code) installed
+- Claude Code installed — `curl -fsSL https://claude.ai/install.sh | bash`
 - A GitHub account
 - Mac or Linux (Raspberry Pi included)
 

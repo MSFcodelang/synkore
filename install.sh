@@ -308,7 +308,10 @@ if ! command -v claude &>/dev/null; then
         npm install -g @anthropic-ai/claude-code
     else
         fail "Claude Code is not installed."
-        info "Install it: https://claude.ai/code — then re-run."
+        info "Install it with one command, then re-run Synkore:"
+        info ""
+        info "  curl -fsSL https://claude.ai/install.sh | bash"
+        info ""
         exit 1
     fi
 fi
