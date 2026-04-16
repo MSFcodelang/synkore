@@ -105,4 +105,14 @@ All bugs found during install.sh testing. Format: BUG-NNN, status, root cause, f
 
 ---
 
+## BUG-053 — Claude Code install command in error message ✅ FIXED
+
+**Status:** Fixed 2026-04-14
+**Environment:** Any system where Claude Code is not installed
+**Symptom:** Error message said `npm install -g @anthropic-ai/claude-code`. Anthropic deprecated npm. User following this installs an outdated version.
+**Root cause:** Error message written before Anthropic switched to native installer.
+**Fix:** Error message now shows `curl -fsSL https://claude.ai/install.sh | bash`.
+
+---
+
 *Log new bugs as BUG-NNN in sequence. Mark fixed with date.*
